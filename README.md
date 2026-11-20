@@ -51,15 +51,29 @@ flutter build apk --release --dart-define=QASYNDA_API=https://qasynda-api.onrend
 
 ## Приложение для iPhone (Mac)
 
-Нужны Xcode, Flutter и CocoaPods.
+Код тот же, что и для Android. Нужны Mac с Xcode, Flutter и CocoaPods, iPhone с iOS 15 или новее и Apple ID.
+
+1. Клонировать репозиторий на Mac.
+2. Один раз открыть `app/ios/Runner.xcworkspace` в Xcode: Runner → Signing & Capabilities → выбрать Team
+   (свой Apple ID) и включить «Automatically manage signing». Если идентификатор `kz.qasynda.qasynda`
+   занят, заменить его на свой, например `kz.qasynda.ИМЯ`.
+3. Подключить iPhone кабелем, разблокировать, нажать «Доверять этому компьютеру».
+   На iOS 16+ включить «Режим разработчика»: Настройки → Конфиденциальность и безопасность.
+4. Запустить:
 
 ```bash
-cd app
-flutter pub get
-cd ios && pod install && cd ..
-open ios/Runner.xcworkspace   # выбрать свою команду в Signing & Capabilities
-flutter run --release --dart-define=QASYNDA_API=https://АДРЕС_СЕРВЕРА
+./scripts/build_ios.sh run
 ```
+
+5. При первом запуске на телефоне: Настройки → Основные → VPN и управление устройством → доверить
+   своему профилю разработчика. Затем разрешить приложению Bluetooth и геолокацию.
+
+С бесплатным Apple ID приложение работает 7 дней, потом его нужно поставить заново; с платным
+аккаунтом разработчика — год.
+
+Особенности iPhone, учтённые в коде: по Bluetooth он транслирует только UUID сервиса, поэтому идентификатор
+маяка зашит в UUID; системный запрос доступа к Bluetooth появляется при первом открытии «Перевести рядом»
+или «Принять рядом»; трансляция идёт, только пока приложение открыто на экране.
 
 ## Как устроена безопасность
 

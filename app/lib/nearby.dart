@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -82,9 +83,17 @@ class Scanner {
   Future<bool> start() async {
     try {
       if (!await FlutterBluePlus.isSupported) return false;
+      // На iPhone первое обращение к Bluetooth вызывает системный запрос доступа. Пока человек
+      // не ответил, состояние остаётся «неизвестно», поэтому ждём ответа дольше, чем на Android.
+      const settled = {
+        BluetoothAdapterState.on,
+        BluetoothAdapterState.off,
+        BluetoothAdapterState.unauthorized,
+        BluetoothAdapterState.unavailable,
+      };
       final state = await FlutterBluePlus.adapterState
-          .firstWhere((s) => s == BluetoothAdapterState.on || s == BluetoothAdapterState.off)
-          .timeout(const Duration(seconds: 3));
+          .firstWhere(settled.contains)
+          .timeout(Duration(seconds: Platform.isIOS ? 30 : 3));
       if (state != BluetoothAdapterState.on) return false;
       _sub = FlutterBluePlus.onScanResults.listen((results) {
         for (final result in results) {
