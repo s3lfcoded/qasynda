@@ -1,0 +1,19 @@
+# Развёртывание сервера на Render (render.com → New → Blueprint → этот репозиторий).
+# Бесплатный тариф: сервис засыпает после 15 минут простоя, диск не сохраняется между перезапусками,
+# поэтому учебные пользователи создаются заново при каждом старте.
+services:
+  - type: web
+    name: qasynda-api
+    runtime: python
+    plan: free
+    region: frankfurt
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    # Один процесс обязателен: маяки получателей хранятся в памяти.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: QASYNDA_SEED_DEMO
+        value: "1"
