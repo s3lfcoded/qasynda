@@ -17,11 +17,11 @@ need() {
 [ "$(uname)" = "Darwin" ] || { echo "Сборка под iPhone возможна только на macOS."; exit 1; }
 need xcodebuild "Установите Xcode из App Store и запустите его один раз."
 need flutter    "Установите Flutter: https://docs.flutter.dev/get-started/install/macos"
-need pod        "Установите CocoaPods: sudo gem install cocoapods (или brew install cocoapods)"
 
 echo "== Зависимости"
 flutter pub get
-(cd ios && pod install)
+# Flutter 3.50 подключает плагины через Swift Package Manager; CocoaPods нужен, только если есть Podfile.
+if [ -f ios/Podfile ]; then (cd ios && pod install); fi
 
 echo "== Проверки"
 flutter analyze --no-fatal-infos

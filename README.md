@@ -51,7 +51,7 @@ flutter build apk --release --dart-define=QASYNDA_API=https://qasynda-api.onrend
 
 ## Приложение для iPhone (Mac)
 
-Код тот же, что и для Android. Нужны Mac с Xcode, Flutter и CocoaPods, iPhone с iOS 15 или новее и Apple ID.
+Код тот же, что и для Android. Нужны Mac с Xcode и Flutter, iPhone с iOS 15 или новее и Apple ID.
 
 1. Клонировать репозиторий на Mac.
 2. Один раз открыть `app/ios/Runner.xcworkspace` в Xcode: Runner → Signing & Capabilities → выбрать Team
