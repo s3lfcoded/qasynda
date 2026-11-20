@@ -11,7 +11,6 @@ class Q {
   static const muted = Color(0xFF8C8C96);
   static const faint = Color(0xFF5B5B64);
   static const accent = Color(0xFFC9F24B);
-  static const accentDeep = Color(0xFFAFD63A); // рисунок на лаймовой поверхности
   static const onAccent = Color(0xFF111208);
   static const ok = Color(0xFF52D98A);
   static const danger = Color(0xFFFF6B6B);
