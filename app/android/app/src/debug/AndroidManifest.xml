@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Только отладочная сборка: разрешён HTTP без шифрования, чтобы ходить на сервер в локальной сети. -->
+    <application android:usesCleartextTraffic="true"/>
+</manifest>
