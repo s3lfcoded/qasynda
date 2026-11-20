@@ -156,7 +156,10 @@ class _PersonCard extends StatelessWidget {
                   ? Pill(icon: Icons.bluetooth_rounded, label: s.t('btNear'), color: Q.blue)
                   : Pill(
                       icon: Icons.location_on_rounded,
-                      label: s.t('gpsNear', {'m': '${person['distance_m']}'}),
+                      // сервер округляет расстояние до 10 м, поэтому «0 м» означает «ближе десяти»
+                      label: (person['distance_m'] as int? ?? 0) < 10
+                          ? s.t('gpsClose')
+                          : s.t('gpsNear', {'m': '${person['distance_m']}'}),
                       color: Q.muted),
             ]),
           ]),
