@@ -20,6 +20,11 @@
 
 ## Сервер
 
+Развёрнут на Render: https://qasynda-api.onrender.com (бесплатный тариф: засыпает после 15 минут простоя,
+первый запрос после сна идёт около минуты; база сбрасывается при перезапуске). Настройки — в `render.yaml`.
+
+Локальный запуск:
+
 ```bash
 cd backend
 python -m venv .venv
@@ -37,10 +42,10 @@ QASYNDA_SEED_DEMO=1 .venv/Scripts/python -m uvicorn app.main:app --host 0.0.0.0 
 source env.sh
 cd app
 flutter test
-flutter build apk --debug --dart-define=QASYNDA_API=http://АДРЕС_СЕРВЕРА:8000
+flutter build apk --release --dart-define=QASYNDA_API=https://qasynda-api.onrender.com
 ```
 
-Готовый файл: `app/build/app/outputs/flutter-apk/app-debug.apk`. Адрес сервера можно поменять и в самом
+Готовый файл: `app/build/app/outputs/flutter-apk/app-release.apk`. Адрес сервера можно поменять и в самом
 приложении — значок сервера на экране входа. HTTP без шифрования разрешён только в отладочной сборке;
 для обычной сборки нужен сервер с HTTPS.
 
