@@ -71,6 +71,9 @@
 		<string>ru</string>
 		<string>kk</string>
 	</array>
+	<!-- Приложение шифрует только обычным HTTPS: TestFlight не будет спрашивать про экспортный контроль -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Bluetooth нужен, чтобы находить получателей перевода рядом с вами.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

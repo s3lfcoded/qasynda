@@ -1,0 +1,87 @@
+# Подписанная сборка под iPhone и загрузка в TestFlight.
+# Запуск только вручную: Actions → «TestFlight» → Run workflow.
+#
+# Нужны четыре секрета репозитория (Settings → Secrets and variables → Actions):
+#   ASC_KEY_ID      — Key ID ключа App Store Connect API
+#   ASC_ISSUER_ID   — Issuer ID (там же, над списком ключей)
+#   ASC_KEY_P8      — содержимое файла AuthKey_XXXX.p8 целиком, вместе со строками BEGIN/END
+#   APPLE_TEAM_ID   — Team ID (developer.apple.com → Membership details)
+# Ключ должен иметь роль Admin: только она позволяет Xcode самому создать сертификат и профиль.
+# В App Store Connect заранее должно быть создано приложение с идентификатором kz.qasynda.qasynda.
+name: TestFlight
+on:
+  workflow_dispatch:
+
+jobs:
+  testflight:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: app
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверить секреты
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          missing=""
+          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 APPLE_TEAM_ID; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Не заданы секреты репозитория:$missing"
+            exit 1
+          fi
+          # Ключ кладётся во временную папку сборочного сервера и исчезает вместе с ним.
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.50.1"
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      # Номер сборки = номер запуска: TestFlight не принимает два файла с одинаковым номером.
+      - name: Настроить проект
+        run: |
+          flutter build ios --config-only --release --no-codesign \
+            --build-number=${{ github.run_number }} \
+            --dart-define=QASYNDA_API=https://qasynda-api.onrender.com
+          cd ios && pod install
+
+      - name: Собрать архив
+        run: |
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic
+
+      - name: Загрузить в TestFlight
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
+            -exportOptionsPlist ios/ExportOptions.plist \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Удалить ключ
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
