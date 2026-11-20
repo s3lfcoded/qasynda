@@ -50,7 +50,8 @@ ThemeData buildTheme() {
       fillColor: Q.surface,
       contentPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
       labelStyle: const TextStyle(color: Q.muted),
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
+      // Underline-вариант держит всплывающую подпись внутри поля, а не на его верхней границе.
+      border: UnderlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
     ),
     snackBarTheme: SnackBarThemeData(
       behavior: SnackBarBehavior.floating,

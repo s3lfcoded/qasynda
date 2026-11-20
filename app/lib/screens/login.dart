@@ -68,11 +68,15 @@ class _LoginScreenState extends State<LoginScreen> {
               const LangToggle(),
             ]),
             const SizedBox(height: 48),
-            Container(
-              width: 76,
-              height: 76,
-              decoration: BoxDecoration(color: Q.accent, borderRadius: BorderRadius.circular(26)),
-              child: const Icon(Icons.near_me_rounded, size: 38, color: Q.ink),
+            // ListView растягивает детей на всю ширину, поэтому логотип выравниваем явно.
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Container(
+                width: 76,
+                height: 76,
+                decoration: BoxDecoration(color: Q.accent, borderRadius: BorderRadius.circular(26)),
+                child: const Icon(Icons.near_me_rounded, size: 38, color: Q.ink),
+              ),
             ),
             const SizedBox(height: 24),
             const Text('Qasynda', style: TextStyle(fontSize: 40, fontWeight: FontWeight.w900, height: 1)),
