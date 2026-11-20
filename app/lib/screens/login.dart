@@ -61,6 +61,8 @@ class _LoginScreenState extends State<LoginScreen> {
     return Scaffold(
       body: SafeArea(
         child: ListView(
+          // На цифровой клавиатуре iPhone нет кнопки «Готово»: клавиатура убирается жестом вниз.
+          keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
           padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
           children: [
             Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [

@@ -209,6 +209,7 @@ class _AmountScreenState extends State<AmountScreen> {
         if (_note.text.trim().isNotEmpty) 'note': _note.text.trim(),
       });
       app.setBalance(receipt['balance'] as int);
+      HapticFeedback.mediumImpact(); // короткий отклик: перевод прошёл
       if (!mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute<void>(builder: (_) => ReceiptScreen(receipt: receipt)));
     } on ApiError catch (e) {
@@ -235,7 +236,7 @@ class _AmountScreenState extends State<AmountScreen> {
           padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
           child: Column(children: [
             Expanded(
-              child: ListView(children: [
+              child: ListView(keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag, children: [
                 Row(children: [
                   Avatar(name: '${person['name']}', merchant: merchant, size: 60),
                   const SizedBox(width: 14),

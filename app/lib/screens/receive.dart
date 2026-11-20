@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../api.dart';
@@ -36,7 +37,9 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
     _started = true;
     _app = AppScope.of(context);
     _sub = _app.incoming.listen((event) {
-      if (mounted) setState(() => _last = event);
+      if (!mounted) return;
+      HapticFeedback.mediumImpact(); // короткий отклик: деньги пришли
+      setState(() => _last = event);
     });
     _begin();
   }
