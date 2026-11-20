@@ -45,6 +45,15 @@ def test_login_rejects_wrong_pin_and_throttles(client):
     assert client.post("/auth/login", json=good).status_code == 429
 
 
+def test_profile_has_card_but_strangers_do_not_see_it(client):
+    me = client.get("/me", headers=auth(client, AIGERIM)).json()
+    assert me["card_last4"] == AIGERIM["card_last4"] and me["balance"] == AIGERIM["balance"]
+    seller, buyer = auth(client, AIGERIM), auth(client, DANIYAR)
+    client.post("/nearby/beacon", json={"location": HERE}, headers=seller)
+    person = client.post("/nearby/discover", json={"location": CLOSE}, headers=buyer).json()["people"][0]
+    assert "card_last4" not in person and "balance" not in person and "phone" not in person
+
+
 def test_requires_auth(client):
     assert client.get("/me").status_code == 401
     assert client.post("/nearby/discover", json={}).status_code == 401

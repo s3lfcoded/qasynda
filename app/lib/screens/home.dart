@@ -1,7 +1,9 @@
 import 'dart:async';
 
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
+import '../bank_card.dart';
 import '../l10n.dart';
 import '../state.dart';
 import '../theme.dart';
@@ -49,81 +51,114 @@ class _HomeScreenState extends State<HomeScreen> {
     final app = AppScope.of(context);
     final s = app.s;
     final profile = app.profile!;
-    final firstName = (profile['name'] as String).split(' ').first;
+    final name = profile['name'] as String;
+    final firstName = name.split(' ').first;
+    final merchant = profile['is_merchant'] == true;
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Qasynda'),
-        actions: [
-          const LangToggle(),
-          IconButton(tooltip: s.t('logout'), onPressed: app.logout, icon: const Icon(Icons.logout_rounded)),
-          const SizedBox(width: 8),
-        ],
-      ),
-      body: RefreshIndicator(
-        color: Q.ink,
-        onRefresh: () => app.refresh().catchError((_) {}),
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(4, 0, 4, 12),
-              child: Text(s.t('hello', {'name': firstName}), style: const TextStyle(fontSize: 16, color: Q.muted)),
-            ),
-            QCard(
-              color: Q.ink,
-              padding: const EdgeInsets.all(24),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(s.t('balance'), style: const TextStyle(color: Colors.white60, fontSize: 15)),
-                const SizedBox(height: 6),
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: darkOverlay,
+      child: Scaffold(
+        body: SafeArea(
+          bottom: false,
+          child: RefreshIndicator(
+            color: Q.onAccent,
+            backgroundColor: Q.accent,
+            onRefresh: () => app.refresh().catchError((_) {}),
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 40),
+              children: [
+                Row(children: [
+                  Avatar(name: firstName, size: 42),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(firstName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700, height: 1.15)),
+                      Text('${profile['phone']}',
+                          style: const TextStyle(fontSize: 13, color: Q.muted, fontFeatures: Q.tabular)),
+                    ]),
+                  ),
+                  const LangToggle(),
+                  const SizedBox(width: 4),
+                  IconButton(
+                    tooltip: s.t('logout'),
+                    onPressed: app.logout,
+                    icon: const Icon(Icons.logout_rounded, color: Q.muted, size: 22),
+                  ),
+                ]),
+                const SizedBox(height: 28),
+                Text(s.t('balance').toUpperCase(),
+                    style: const TextStyle(fontSize: 12, color: Q.muted, fontWeight: FontWeight.w700, letterSpacing: 1.4)),
+                const SizedBox(height: 4),
                 FittedBox(
                   fit: BoxFit.scaleDown,
                   alignment: Alignment.centerLeft,
                   child: Text(money(profile['balance'] as int),
-                      style: const TextStyle(color: Colors.white, fontSize: 40, fontWeight: FontWeight.w800, height: 1.1)),
+                      style: const TextStyle(
+                          fontSize: 46, fontWeight: FontWeight.w800, height: 1.1, letterSpacing: -1.2, fontFeatures: Q.tabular)),
                 ),
-                if (profile['is_merchant'] == true) ...[
-                  const SizedBox(height: 14),
-                  Pill(icon: Icons.verified_rounded, label: '${profile['business_name']}', color: Q.accent),
-                ],
-              ]),
-            ),
-            const SizedBox(height: 12),
-            IntrinsicHeight(
-              child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                Expanded(
-                  child: _Action(
-                    color: Q.accent,
-                    icon: Icons.near_me_rounded,
-                    title: s.t('sendNearby'),
-                    hint: s.t('sendNearbyHint'),
-                    onTap: () => _open(const SendScreen()),
+                const SizedBox(height: 20),
+                BankCard(
+                  holder: name,
+                  last4: '${profile['card_last4'] ?? '0000'}',
+                  business: merchant ? '${profile['business_name']}' : null,
+                ),
+                const SizedBox(height: 12),
+                IntrinsicHeight(
+                  child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                    Expanded(
+                      child: _Action(
+                        primary: true,
+                        icon: Icons.near_me_rounded,
+                        title: s.t('sendNearby'),
+                        hint: s.t('sendNearbyHint'),
+                        onTap: () => _open(const SendScreen()),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: _Action(
+                        primary: false,
+                        icon: Icons.sensors_rounded,
+                        title: s.t('receiveNearby'),
+                        hint: s.t('receiveNearbyHint'),
+                        onTap: () => _open(const ReceiveScreen()),
+                      ),
+                    ),
+                  ]),
+                ),
+                const SizedBox(height: 32),
+                Row(crossAxisAlignment: CrossAxisAlignment.baseline, textBaseline: TextBaseline.alphabetic, children: [
+                  Text(s.t('history'), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, letterSpacing: -0.3)),
+                  const SizedBox(width: 8),
+                  if (app.history.isNotEmpty)
+                    Text('${app.history.length}',
+                        style: const TextStyle(fontSize: 15, color: Q.faint, fontWeight: FontWeight.w700, fontFeatures: Q.tabular)),
+                ]),
+                const SizedBox(height: 12),
+                if (app.history.isEmpty)
+                  QCard(
+                    child: Row(children: [
+                      const Icon(Icons.receipt_long_outlined, color: Q.faint, size: 22),
+                      const SizedBox(width: 12),
+                      Text(s.t('historyEmpty'), style: const TextStyle(color: Q.muted, fontSize: 15)),
+                    ]),
+                  )
+                else
+                  QCard(
+                    padding: EdgeInsets.zero,
+                    child: Column(children: [
+                      for (var i = 0; i < app.history.length; i++) ...[
+                        if (i > 0) const Divider(height: 1, thickness: 1, indent: 72, color: Q.line),
+                        _HistoryRow(app.history[i]),
+                      ],
+                    ]),
                   ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _Action(
-                    color: Q.surface,
-                    icon: Icons.sensors_rounded,
-                    title: s.t('receiveNearby'),
-                    hint: s.t('receiveNearbyHint'),
-                    onTap: () => _open(const ReceiveScreen()),
-                  ),
-                ),
-              ]),
+              ],
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(4, 28, 4, 12),
-              child: Text(s.t('history'), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
-            ),
-            if (app.history.isEmpty)
-              QCard(child: Text(s.t('historyEmpty'), style: const TextStyle(color: Q.muted)))
-            else
-              QCard(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: Column(children: [for (final item in app.history) _HistoryRow(item)]),
-              ),
-          ],
+          ),
         ),
       ),
     );
@@ -131,8 +166,8 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 class _Action extends StatelessWidget {
-  const _Action({required this.color, required this.icon, required this.title, required this.hint, required this.onTap});
-  final Color color;
+  const _Action({required this.primary, required this.icon, required this.title, required this.hint, required this.onTap});
+  final bool primary;
   final IconData icon;
   final String title;
   final String hint;
@@ -141,14 +176,23 @@ class _Action extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return QCard(
-      color: color,
       onTap: onTap,
+      padding: const EdgeInsets.all(16),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Icon(icon, size: 30, color: Q.ink),
-        const SizedBox(height: 28),
-        Text(title, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800, height: 1.15)),
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(color: primary ? Q.accent : Q.raised, borderRadius: BorderRadius.circular(14)),
+            child: Icon(icon, size: 22, color: primary ? Q.onAccent : Q.text),
+          ),
+          const Spacer(),
+          const Icon(Icons.arrow_outward_rounded, size: 18, color: Q.faint),
+        ]),
+        const SizedBox(height: 22),
+        Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, height: 1.2, letterSpacing: -0.2)),
         const SizedBox(height: 4),
-        Text(hint, style: TextStyle(fontSize: 13, color: Q.ink.withValues(alpha: 0.6))),
+        Text(hint, style: const TextStyle(fontSize: 13, color: Q.muted, height: 1.25)),
       ]),
     );
   }
@@ -161,35 +205,41 @@ class _HistoryRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final incoming = item['direction'] == 'in';
+    final bluetooth = item['method'] == 'bluetooth';
     final at = DateTime.fromMillisecondsSinceEpoch(((item['created_at'] as num) * 1000).round());
     String two(int v) => v.toString().padLeft(2, '0');
-    final when = '${two(at.day)}.${two(at.month)} ${two(at.hour)}:${two(at.minute)}';
-    final method = item['method'] == 'bluetooth' ? 'Bluetooth' : 'GPS';
+    final when = '${two(at.day)}.${two(at.month)} · ${two(at.hour)}:${two(at.minute)}';
 
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
       child: Row(children: [
         Container(
-          width: 44,
-          height: 44,
-          decoration: BoxDecoration(color: Q.bg, borderRadius: BorderRadius.circular(15)),
+          width: 42,
+          height: 42,
+          decoration: BoxDecoration(color: Q.raised, borderRadius: BorderRadius.circular(14)),
           child: Icon(incoming ? Icons.south_west_rounded : Icons.north_east_rounded,
-              color: incoming ? Q.ok : Q.ink, size: 22),
+              color: incoming ? Q.ok : Q.text, size: 20),
         ),
-        const SizedBox(width: 12),
+        const SizedBox(width: 14),
         Expanded(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text('${item['counterparty']}',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 2),
-            Text('$method · $when', style: const TextStyle(fontSize: 13, color: Q.muted)),
+                style: const TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 3),
+            Row(children: [
+              Icon(bluetooth ? Icons.bluetooth_rounded : Icons.location_on_rounded, size: 13, color: Q.faint),
+              const SizedBox(width: 3),
+              Text('${bluetooth ? 'Bluetooth' : 'GPS'} · $when',
+                  style: const TextStyle(fontSize: 12.5, color: Q.muted, fontFeatures: Q.tabular)),
+            ]),
           ]),
         ),
-        const SizedBox(width: 8),
+        const SizedBox(width: 10),
         Text('${incoming ? '+' : '−'}${money(item['amount'] as int)}',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: incoming ? Q.ok : Q.ink)),
+            style: TextStyle(
+                fontSize: 15.5, fontWeight: FontWeight.w700, color: incoming ? Q.ok : Q.text, fontFeatures: Q.tabular)),
       ]),
     );
   }

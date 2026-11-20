@@ -99,7 +99,7 @@ class _SendScreenState extends State<SendScreen> {
                 child: Padding(
                   padding: const EdgeInsets.all(28),
                   child: Column(mainAxisSize: MainAxisSize.min, children: [
-                    const Radar(child: Icon(Icons.near_me_rounded, size: 44, color: Q.ink)),
+                    const Radar(child: Icon(Icons.near_me_rounded, size: 44, color: Q.accent)),
                     const SizedBox(height: 16),
                     Text(_error != null ? s.error(_error!) : s.t('searching'),
                         textAlign: TextAlign.center,
@@ -273,7 +273,7 @@ class _AmountScreenState extends State<AmountScreen> {
             FilledButton(
               onPressed: ready ? _submit : null,
               child: _busy
-                  ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5, color: Q.ink))
+                  ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5, color: Q.onAccent))
                   : Text(_tiyn > 0 ? s.t('pay', {'sum': money(_tiyn)}) : s.t('payEmpty')),
             ),
           ]),
@@ -305,7 +305,7 @@ class ReceiptScreen extends StatelessWidget {
                     width: 96,
                     height: 96,
                     decoration: const BoxDecoration(color: Q.accent, shape: BoxShape.circle),
-                    child: const Icon(Icons.check_rounded, size: 56, color: Q.ink),
+                    child: const Icon(Icons.check_rounded, size: 56, color: Q.onAccent),
                   ),
                   const SizedBox(height: 20),
                   Text(s.t('sent'), style: const TextStyle(fontSize: 17, color: Q.muted)),

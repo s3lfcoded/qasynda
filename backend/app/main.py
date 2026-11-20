@@ -129,6 +129,7 @@ def profile(user: dict) -> dict:
     return {
         "name": user["full_name"], "phone": user["phone"], "balance": user["balance"],
         "is_merchant": bool(user["is_merchant"]), "business_name": user["business_name"],
+        "card_last4": user["card_last4"],
     }
 
 

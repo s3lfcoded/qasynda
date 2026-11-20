@@ -14,7 +14,11 @@ class QCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Material(
       color: color,
-      borderRadius: BorderRadius.circular(Q.radius),
+      // На чёрном фоне тёмную поверхность отделяет тонкая линия, а не тень.
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(Q.radius),
+        side: color == Q.surface ? const BorderSide(color: Q.line) : BorderSide.none,
+      ),
       clipBehavior: Clip.antiAlias,
       child: InkWell(onTap: onTap, child: Padding(padding: padding, child: child)),
     );
@@ -35,16 +39,20 @@ class LangToggle extends StatelessWidget {
         behavior: HitTestBehavior.opaque,
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(color: active ? Q.ink : Colors.transparent, borderRadius: BorderRadius.circular(12)),
+          decoration: BoxDecoration(color: active ? Q.text : Colors.transparent, borderRadius: BorderRadius.circular(11)),
           child: Text(label,
-              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: active ? Colors.white : Q.muted)),
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: active ? Q.onAccent : Q.muted)),
         ),
       );
     }
 
     return Container(
       padding: const EdgeInsets.all(3),
-      decoration: BoxDecoration(color: Q.surface, borderRadius: BorderRadius.circular(15)),
+      decoration: BoxDecoration(
+        color: Q.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Q.line),
+      ),
       child: Row(mainAxisSize: MainAxisSize.min, children: [item('ru', 'РУС'), item('kk', 'ҚАЗ')]),
     );
   }
@@ -62,11 +70,11 @@ class Avatar extends StatelessWidget {
       width: size,
       height: size,
       alignment: Alignment.center,
-      decoration: BoxDecoration(color: merchant ? Q.accent : Q.bg, borderRadius: BorderRadius.circular(size * 0.36)),
+      decoration: BoxDecoration(color: merchant ? Q.accent : Q.raised, borderRadius: BorderRadius.circular(size * 0.36)),
       child: merchant
-          ? Icon(Icons.storefront_rounded, color: Q.ink, size: size * 0.5)
+          ? Icon(Icons.storefront_rounded, color: Q.onAccent, size: size * 0.5)
           : Text(name.isEmpty ? '?' : name.characters.first.toUpperCase(),
-              style: TextStyle(fontSize: size * 0.42, fontWeight: FontWeight.w800, color: Q.ink)),
+              style: TextStyle(fontSize: size * 0.42, fontWeight: FontWeight.w800, color: Q.text)),
     );
   }
 }
@@ -81,7 +89,7 @@ class Pill extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(color: color.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(10)),
+      decoration: BoxDecoration(color: color.withValues(alpha: 0.14), borderRadius: BorderRadius.circular(10)),
       child: Row(mainAxisSize: MainAxisSize.min, children: [
         Icon(icon, size: 14, color: color),
         const SizedBox(width: 5),
@@ -97,7 +105,7 @@ class Pill extends StatelessWidget {
 
 /// Расходящиеся круги: «идёт поиск» или «вас видят».
 class Radar extends StatefulWidget {
-  const Radar({super.key, required this.child, this.size = 220, this.color = Q.ink});
+  const Radar({super.key, required this.child, this.size = 220, this.color = Q.accent});
   final Widget child;
   final double size;
   final Color color;
@@ -143,7 +151,7 @@ class _RadarPainter extends CustomPainter {
       final paint = Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2
-        ..color = color.withValues(alpha: (1 - phase) * 0.25);
+        ..color = color.withValues(alpha: (1 - phase) * 0.45);
       canvas.drawCircle(center, max * (0.35 + 0.65 * phase), paint);
     }
   }

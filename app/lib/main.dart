@@ -1,5 +1,6 @@
 import 'package:flutter_localizations/flutter_localizations.dart'
     show GlobalCupertinoLocalizations, GlobalWidgetsLocalizations;
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'screens/home.dart';
@@ -9,6 +10,7 @@ import 'theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setSystemUIOverlayStyle(darkOverlay);
   runApp(QasyndaApp(state: AppState()..boot()));
 }
 

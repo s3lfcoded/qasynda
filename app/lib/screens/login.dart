@@ -75,7 +75,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 width: 76,
                 height: 76,
                 decoration: BoxDecoration(color: Q.accent, borderRadius: BorderRadius.circular(26)),
-                child: const Icon(Icons.near_me_rounded, size: 38, color: Q.ink),
+                child: const Icon(Icons.near_me_rounded, size: 38, color: Q.onAccent),
               ),
             ),
             const SizedBox(height: 24),
@@ -107,7 +107,7 @@ class _LoginScreenState extends State<LoginScreen> {
             FilledButton(
               onPressed: _valid && !_busy ? _submit : null,
               child: _busy
-                  ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5, color: Q.ink))
+                  ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5, color: Q.onAccent))
                   : Text(s.t('login')),
             ),
           ],

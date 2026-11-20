@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS users(
     full_name TEXT NOT NULL,
     balance INTEGER NOT NULL CHECK(balance >= 0),
     is_merchant INTEGER NOT NULL DEFAULT 0,
-    business_name TEXT
+    business_name TEXT,
+    card_last4 TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions(
     token_hash TEXT PRIMARY KEY,
@@ -45,11 +46,11 @@ CREATE TABLE IF NOT EXISTS transfers(
 # Учебные пользователи. Только для демо: включается переменной QASYNDA_SEED_DEMO=1.
 DEMO_USERS = [
     {"phone": "+77010000001", "pin": "1111", "full_name": "Айгерим Касымова",
-     "balance": 250_000_00, "is_merchant": 0, "business_name": None},
+     "balance": 250_000_00, "is_merchant": 0, "business_name": None, "card_last4": "4417"},
     {"phone": "+77010000002", "pin": "2222", "full_name": "Данияр Ахметов",
-     "balance": 1_200_000_00, "is_merchant": 0, "business_name": None},
+     "balance": 1_200_000_00, "is_merchant": 0, "business_name": None, "card_last4": "8052"},
     {"phone": "+77010000003", "pin": "3333", "full_name": "Нурлан Сейтов",
-     "balance": 80_000_00, "is_merchant": 1, "business_name": "ИП Сейтов · Жеміс-жидек"},
+     "balance": 80_000_00, "is_merchant": 1, "business_name": "ИП Сейтов · Жеміс-жидек", "card_last4": "1906"},
 ]
 
 
@@ -91,10 +92,10 @@ def seed_demo() -> None:
         for u in DEMO_USERS:
             salt = secrets.token_hex(16)
             c.execute(
-                "INSERT INTO users(phone, pin_hash, pin_salt, full_name, balance, is_merchant, business_name)"
-                " VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO users(phone, pin_hash, pin_salt, full_name, balance, is_merchant, business_name, card_last4)"
+                " VALUES(?,?,?,?,?,?,?,?)",
                 (u["phone"], _hash_pin(u["pin"], salt), salt, u["full_name"],
-                 u["balance"], u["is_merchant"], u["business_name"]),
+                 u["balance"], u["is_merchant"], u["business_name"], u["card_last4"]),
             )
 
 
