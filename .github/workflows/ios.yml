@@ -22,3 +22,16 @@ jobs:
           cache: true
       - run: flutter pub get
       - run: flutter build ios --release --no-codesign --dart-define=QASYNDA_API=https://qasynda-api.onrender.com
+      # .ipa — это zip с папкой Payload. Файл без подписи: её добавляет Sideloadly или Xcode при установке.
+      - name: Упаковать в .ipa
+        run: |
+          mkdir Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry Qasynda-unsigned.ipa Payload
+          ls -lh Qasynda-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Qasynda-unsigned-ipa
+          path: app/Qasynda-unsigned.ipa
+          retention-days: 14
+          if-no-files-found: error
