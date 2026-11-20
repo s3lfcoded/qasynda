@@ -26,6 +26,7 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
   bool _bluetooth = false;
   bool _gps = false;
   bool _online = true;
+  bool _checked = false; // Bluetooth и геолокация уже опрошены: до этого предупреждение не показываем
   Map<String, dynamic>? _last;
 
   @override
@@ -51,6 +52,7 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
       }
       setState(() => _bluetooth = ok);
     }
+    setState(() => _checked = true);
     _timer = Timer.periodic(const Duration(seconds: 15), (_) => _beat());
   }
 
@@ -144,7 +146,7 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
                 color: _gps ? Q.ok : Q.muted,
               ),
             ]),
-            if (!_bluetooth && !_gps) ...[
+            if (_checked && !_bluetooth && !_gps) ...[
               const SizedBox(height: 12),
               Text(s.t('needNearby'), textAlign: TextAlign.center, style: const TextStyle(color: Q.danger)),
             ],
