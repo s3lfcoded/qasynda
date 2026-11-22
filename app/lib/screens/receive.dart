@@ -130,9 +130,12 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
                           child: const Icon(Icons.check_rounded, size: 56, color: Q.onAccent),
                         ),
                         const SizedBox(height: 20),
-                        Text(s.t('received', {'sum': money(last['amount'] as int)}),
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w900)),
+                        Sensitive(
+                          builder: (_, shown) => Text(
+                              s.t('received', {'sum': shown ? money(last['amount'] as int) : '$masked ₸'}),
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w900)),
+                        ),
                         const SizedBox(height: 6),
                         Text(s.t('from', {'name': '${last['sender']}'}),
                             style: const TextStyle(fontSize: 17, color: Q.muted)),

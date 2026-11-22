@@ -26,7 +26,7 @@ class _LockScreenState extends State<LockScreen> {
     if (_asked) return;
     _asked = true;
     // Системное окно Face ID открывается само, как только экран показан.
-    WidgetsBinding.instance.addPostFrameCallback((_) => AppScope.of(context).unlockWithBiometrics());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _biometrics());
   }
 
   @override
@@ -36,6 +36,15 @@ class _LockScreenState extends State<LockScreen> {
   }
 
   bool get _valid => RegExp(r'^\d{4,6}$').hasMatch(_pin.text);
+
+  Future<void> _biometrics() async {
+    final app = AppScope.of(context);
+    try {
+      await app.unlockWithBiometrics();
+    } on ApiError catch (e) {
+      if (mounted) showError(context, app.s.error(e.code, e.detail));
+    }
+  }
 
   Future<void> _submit() async {
     final app = AppScope.of(context);
@@ -90,7 +99,7 @@ class _LockScreenState extends State<LockScreen> {
             if (app.biometricAvailable && app.biometricEnabled) ...[
               const SizedBox(height: 12),
               OutlinedButton.icon(
-                onPressed: _busy ? null : app.unlockWithBiometrics,
+                onPressed: _busy ? null : _biometrics,
                 icon: const Icon(Icons.fingerprint_rounded),
                 label: Text(s.t('useBio')),
               ),

@@ -333,7 +333,10 @@ class ReceiptScreen extends StatelessWidget {
                   const SizedBox(height: 20),
                   Text(s.t('sent'), style: const TextStyle(fontSize: 17, color: Q.muted)),
                   const SizedBox(height: 6),
-                  Text(money(receipt['amount'] as int), style: const TextStyle(fontSize: 40, fontWeight: FontWeight.w900)),
+                  Sensitive(
+                    builder: (_, shown) => Text(shown ? money(receipt['amount'] as int) : '$masked ₸',
+                        style: const TextStyle(fontSize: 40, fontWeight: FontWeight.w900)),
+                  ),
                   const SizedBox(height: 10),
                   Text(merchant ? '${recipient['business_name']}' : '${recipient['name']}',
                       textAlign: TextAlign.center, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700)),

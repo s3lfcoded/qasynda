@@ -57,6 +57,9 @@ _transfer_rate = guard.Window(10, 60)
 _pair_rate = guard.Window(3, 600)            # одному и тому же получателю
 
 HexId = Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")]
+# Сколько услышанных меток учитывается. Остальные отбрасываются: иначе передатчик, рассылающий сотни
+# поддельных меток, ломал бы оплату всем вокруг. Приложение присылает сначала самые сильные сигналы.
+MAX_BLE_IDS = 64
 DeviceSecret = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{32,128}$")]
 
 
@@ -82,7 +85,9 @@ class ConfirmIn(BaseModel):
 
 
 class UnlockIn(BaseModel):
-    pin: str = Field(pattern=r"^\d{4,6}$")
+    """PIN или секрет из хранилища под биометрией — одно из двух."""
+    pin: str | None = Field(default=None, pattern=r"^\d{4,6}$")
+    bio_secret: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{32,128}$")
 
 
 class BeaconIn(BaseModel):
@@ -91,12 +96,12 @@ class BeaconIn(BaseModel):
 
 class DiscoverIn(BaseModel):
     location: Location | None = None
-    ble_ids: list[HexId] = Field(default_factory=list, max_length=50)
+    ble_ids: list[HexId] = Field(default_factory=list, max_length=500)
 
 
 class TransferIn(BaseModel):
     public_id: HexId
-    ble_ids: list[HexId] = Field(default_factory=list, max_length=50)
+    ble_ids: list[HexId] = Field(default_factory=list, max_length=500)
     location: Location | None = None
     amount: int = Field(gt=0, le=LIMIT_BLUETOOTH)
     idempotency_key: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
@@ -292,13 +297,30 @@ def current_user(authorization: Annotated[str | None, Header()] = None) -> dict:
 User = Annotated[dict, Depends(current_user)]
 
 
+def unlocked_user(user: User, authorization: Annotated[str | None, Header()] = None) -> dict:
+    """Пользователь, чья сессия разблокирована PIN или биометрией не дольше UNLOCK_TTL назад.
+    Без этого токен сессии сам по себе открывал бы переводы, и блокировка приложения была бы
+    только картинкой: любой, кто добрался до токена или до экрана в обход блокировки, переводил бы деньги."""
+    now = time.time()
+    until = user.get("session_unlocked_until") or 0
+    if until <= now:
+        raise fail(403, "locked")
+    if until - now < db.UNLOCK_TTL - 30:
+        db.set_unlocked(_bearer(authorization), now + db.UNLOCK_TTL)
+    return user
+
+
+Unlocked = Annotated[dict, Depends(unlocked_user)]
+
+
 def client_ip(request: Request) -> str | None:
-    """Адрес клиента для ограничений. За прокси сокет показывает адрес прокси, а X-Forwarded-For
-    клиент может подделать, поэтому заголовок с настоящим адресом задаётся явно (QASYNDA_IP_HEADER)."""
-    if IP_HEADER:
-        value = request.headers.get(IP_HEADER, "").split(",")[0].strip()
-        return value or None
-    return request.client.host if request.client else None
+    """Адрес клиента для ограничений, только если задан QASYNDA_IP_HEADER — заголовок, который прокси
+    заполняет сам. Адрес соединения не годится: за прокси хостинга он у всех пользователей один,
+    и любой мог бы исчерпать общий лимит и закрыть вход всем. X-Forwarded-For клиент может подделать."""
+    if not IP_HEADER:
+        return None
+    value = request.headers.get(IP_HEADER, "").split(",")[0].strip()
+    return value or None
 
 
 def pin_gate(key: object, ip: str | None) -> list[tuple[guard.Window, object]]:
@@ -414,18 +436,47 @@ def confirm(body: ConfirmIn, request: Request) -> dict:
 
 
 @app.post("/auth/unlock")
-def unlock(body: UnlockIn, request: Request, user: User,
-           authorization: Annotated[str | None, Header()] = None) -> dict:
-    """Код при открытии приложения проверяет сервер, с теми же лимитами, что и вход.
-    Когда попытки кончаются, сессия закрывается: дальше только полный вход."""
+def unlock(body: UnlockIn, user: User, authorization: Annotated[str | None, Header()] = None) -> dict:
+    """Разблокировка: PIN или секрет, который приложение достаёт из хранилища только после Face ID
+    или отпечатка владельца. Код телефона его не открывает. Пять ошибок за 15 минут — сессия закрыта."""
+    if (body.pin is None) == (body.bio_secret is None):
+        raise fail(422, "pin_or_bio_required")
     key = ("unlock", user["id"], user["session_device"])
+    token = _bearer(authorization)
     if not _unlock_rate.take(key):
-        db.logout(_bearer(authorization))
+        db.logout(token)
         _unlock_rate.clear(key)
         raise fail(401, "unauthorized")
-    if not db.check_pin(user, body.pin):
-        raise fail(403, "invalid_pin")
+    ok = db.check_pin(user, body.pin) if body.pin is not None else db.check_bio(user["session_device"], body.bio_secret)
+    if not ok:
+        raise fail(403, "invalid_pin" if body.pin is not None else "invalid_bio")
     _unlock_rate.clear(key)
+    db.set_unlocked(token, time.time() + db.UNLOCK_TTL)
+    return {"ok": True, "ttl": db.UNLOCK_TTL}
+
+
+@app.post("/auth/lock")
+def lock(user: User, authorization: Annotated[str | None, Header()] = None) -> dict:
+    """Приложение заблокировалось — сервер тоже перестаёт пускать к переводам."""
+    db.set_unlocked(_bearer(authorization), 0)
+    return {"ok": True}
+
+
+@app.post("/auth/bio-key")
+def bio_key(user: Unlocked) -> dict:
+    """Новый секрет для биометрии этого устройства. Только из разблокированной сессии:
+    иначе вор с заблокированным телефоном привязал бы своё лицо."""
+    if not user["session_device"]:
+        raise fail(400, "device_required")
+    secret = secrets.token_urlsafe(32)
+    db.set_bio(user["session_device"], secret)
+    return {"bio_secret": secret}
+
+
+@app.delete("/auth/bio-key")
+def bio_key_off(user: User) -> dict:
+    if user["session_device"]:
+        db.set_bio(user["session_device"], None)
     return {"ok": True}
 
 
@@ -437,12 +488,12 @@ def logout(user: User, authorization: Annotated[str | None, Header()] = None) ->
 
 
 @app.get("/devices")
-def devices(user: User) -> dict:
+def devices(user: Unlocked) -> dict:
     return {"items": [{**d, "current": d["id"] == user["session_device"]} for d in db.devices(user["id"])]}
 
 
 @app.delete("/devices/{device_id}")
-def remove_device(device_id: Annotated[str, Path(pattern=r"^[0-9a-f]{16}$")], user: User) -> dict:
+def remove_device(device_id: Annotated[str, Path(pattern=r"^[0-9a-f]{16}$")], user: Unlocked) -> dict:
     """Отвязать устройство: его сессии закрываются, а вход с него снова потребует SMS."""
     removed = db.remove_devices(user["id"], [device_id])
     if not removed:
@@ -452,7 +503,7 @@ def remove_device(device_id: Annotated[str, Path(pattern=r"^[0-9a-f]{16}$")], us
 
 
 @app.post("/devices/logout-others")
-def logout_others(user: User) -> dict:
+def logout_others(user: Unlocked) -> dict:
     others = [d["id"] for d in db.devices(user["id"]) if d["id"] != user["session_device"]]
     removed = db.remove_devices(user["id"], others)
     hub.kick(user["id"], removed)
@@ -460,12 +511,12 @@ def logout_others(user: User) -> dict:
 
 
 @app.get("/me")
-def me(user: User) -> dict:
+def me(user: Unlocked) -> dict:
     return profile(user)
 
 
 @app.post("/nearby/beacon")
-def beacon_on(body: BeaconIn, user: User) -> dict:
+def beacon_on(body: BeaconIn, user: Unlocked) -> dict:
     """Экран «Принять рядом» открыт. Клиент повторяет запрос каждые ~15 секунд, пока экран открыт;
     Bluetooth-метка в ответе периодически меняется, и приложение начинает транслировать новую."""
     if wait := guard.take_all([(_beacon_rate, user["id"])]):
@@ -483,12 +534,12 @@ def beacon_off(user: User) -> dict:
 
 
 @app.post("/nearby/discover")
-def discover(body: DiscoverIn, user: User) -> dict:
+def discover(body: DiscoverIn, user: Unlocked) -> dict:
     """Кто рядом принимает перевод. Найденные по Bluetooth идут первыми и помечены как подтверждённые."""
     if wait := guard.take_all([(_discover_rate, user["id"])]):
         raise slow_down(wait)
     found: dict[int, dict] = {}
-    for beacon in nearby.by_ble(body.ble_ids):
+    for beacon in nearby.by_ble(body.ble_ids[:MAX_BLE_IDS]):
         found[beacon.user_id] = {"public_id": beacon.public_id, "method": "bluetooth", "proximity": "close"}
     loc, gps = trusted_location(user["id"], body.location)
     if loc:
@@ -512,7 +563,7 @@ def discover(body: DiscoverIn, user: User) -> dict:
 
 
 @app.post("/transfers")
-async def transfer(body: TransferIn, user: User) -> dict:
+async def transfer(body: TransferIn, user: Unlocked) -> dict:
     beacon = nearby.by_public(body.public_id)
     if not beacon:
         raise fail(404, "recipient_not_available")
@@ -526,7 +577,7 @@ async def transfer(body: TransferIn, user: User) -> dict:
     # Клиент присылает все маяки, которые сейчас слышит по Bluetooth; какой из них чей, знает только сервер.
     loc, _ = trusted_location(user["id"], body.location)
     valid = beacon.ble_ids(nearby.clock())
-    if any(hmac.compare_digest(seen, ble) for seen in body.ble_ids for ble in valid):
+    if any(hmac.compare_digest(seen, ble) for seen in body.ble_ids[:MAX_BLE_IDS] for ble in valid):
         method, limit = "bluetooth", LIMIT_BLUETOOTH
     elif loc and nearby.gps_distance(beacon, loc.lat, loc.lon, loc.accuracy) is not None:
         method, limit = "gps", LIMIT_GPS
@@ -562,7 +613,7 @@ async def transfer(body: TransferIn, user: User) -> dict:
 
 
 @app.get("/transfers")
-def transfers(user: User, limit: Annotated[int, Query(ge=1, le=100)] = 30) -> dict:
+def transfers(user: Unlocked, limit: Annotated[int, Query(ge=1, le=100)] = 30) -> dict:
     items = []
     for row in db.history(user["id"], limit):
         outgoing = row["sender_id"] == user["id"]

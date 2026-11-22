@@ -11,6 +11,9 @@ import uuid
 from contextlib import closing
 
 SESSION_TTL = 12 * 3600
+# Сессия «разблокирована» только 5 минут после последнего действия: переводы, баланс и устройства
+# доступны лишь в этом окне. Сам токен сессии без разблокировки годится только для разблокировки и выхода.
+UNLOCK_TTL = 5 * 60
 PBKDF2_ROUNDS = 100_000
 DAY = 24 * 3600
 
@@ -33,13 +36,15 @@ CREATE TABLE IF NOT EXISTS devices(
     name TEXT NOT NULL,
     created_at REAL NOT NULL,
     last_seen REAL NOT NULL,
+    bio_hash TEXT,
     UNIQUE(user_id, secret_hash)
 );
 CREATE TABLE IF NOT EXISTS sessions(
     token_hash TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id),
     expires_at REAL NOT NULL,
-    device_id TEXT REFERENCES devices(id)
+    device_id TEXT REFERENCES devices(id),
+    unlocked_until REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS transfers(
     id TEXT PRIMARY KEY,
@@ -87,9 +92,14 @@ def init() -> None:
     with closing(connect()) as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
-        # База, созданная до привязки устройств: у старых сессий устройства нет, они просто истекут.
-        if "device_id" not in {r["name"] for r in c.execute("PRAGMA table_info(sessions)")}:
+        # База, созданная раньше: недостающие столбцы добавляются, старые сессии просто истекут.
+        columns = {r["name"] for r in c.execute("PRAGMA table_info(sessions)")}
+        if "device_id" not in columns:
             c.execute("ALTER TABLE sessions ADD COLUMN device_id TEXT REFERENCES devices(id)")
+        if "unlocked_until" not in columns:
+            c.execute("ALTER TABLE sessions ADD COLUMN unlocked_until REAL NOT NULL DEFAULT 0")
+        if "bio_hash" not in {r["name"] for r in c.execute("PRAGMA table_info(devices)")}:
+            c.execute("ALTER TABLE devices ADD COLUMN bio_hash TEXT")
 
 
 def _hash_pin(pin: str, salt: str) -> str:
@@ -150,8 +160,9 @@ def create_session(user_id: int, device_id: str) -> str:
     now = time.time()
     with closing(connect()) as c:
         c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
-        c.execute("INSERT INTO sessions(token_hash, user_id, expires_at, device_id) VALUES(?,?,?,?)",
-                  (_sha(token), user_id, now + SESSION_TTL, device_id))
+        # Сессия открывается сразу после ввода PIN, поэтому она разблокирована.
+        c.execute("INSERT INTO sessions(token_hash, user_id, expires_at, device_id, unlocked_until)"
+                  " VALUES(?,?,?,?,?)", (_sha(token), user_id, now + SESSION_TTL, device_id, now + UNLOCK_TTL))
         c.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
     return token
 
@@ -168,7 +179,8 @@ def user_by_token(token: str) -> dict | None:
     now = time.time()
     with closing(connect()) as c:
         row = c.execute(
-            "SELECT u.*, s.device_id AS session_device FROM sessions s JOIN users u ON u.id = s.user_id"
+            "SELECT u.*, s.device_id AS session_device, s.unlocked_until AS session_unlocked_until"
+            " FROM sessions s JOIN users u ON u.id = s.user_id"
             " WHERE s.token_hash=? AND s.expires_at > ?",
             (_sha(token), now),
         ).fetchone()
@@ -176,6 +188,26 @@ def user_by_token(token: str) -> dict | None:
             c.execute("UPDATE devices SET last_seen=? WHERE id=? AND last_seen < ?",
                       (now, row["session_device"], now - 60))
         return dict(row) if row else None
+
+
+def set_unlocked(token: str, until: float) -> None:
+    with closing(connect()) as c:
+        c.execute("UPDATE sessions SET unlocked_until=? WHERE token_hash=?", (until, _sha(token)))
+
+
+def set_bio(device_id: str, secret: str | None) -> None:
+    """Секрет для разблокировки по биометрии: приложение хранит его в хранилище, которое открывается
+    только лицом или пальцем владельца; на сервере — только хеш."""
+    with closing(connect()) as c:
+        c.execute("UPDATE devices SET bio_hash=? WHERE id=?", (_sha(secret) if secret else None, device_id))
+
+
+def check_bio(device_id: str | None, secret: str) -> bool:
+    if not device_id:
+        return False
+    with closing(connect()) as c:
+        row = c.execute("SELECT bio_hash FROM devices WHERE id=?", (device_id,)).fetchone()
+    return bool(row and row["bio_hash"]) and hmac.compare_digest(row["bio_hash"], _sha(secret))
 
 
 def user_by_id(user_id: int) -> dict | None:

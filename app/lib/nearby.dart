@@ -77,13 +77,17 @@ class Advertiser {
 /// Отправитель: слушает эфир и запоминает маяки Qasynda, услышанные за последние секунды.
 class Scanner {
   static const _freshFor = Duration(seconds: 12);
-  final _seen = <String, DateTime>{};
+  // Сколько меток отправлять серверу. Передатчик рядом может рассылать сотни поддельных меток,
+  // поэтому берутся самые сильные сигналы: настоящий получатель обычно ближе всех.
+  static const _maxIds = 20;
+  final _seen = <String, (DateTime, int)>{};
   StreamSubscription<List<ScanResult>>? _sub;
 
   List<String> get bleIds {
     final edge = DateTime.now().subtract(_freshFor);
-    _seen.removeWhere((_, at) => at.isBefore(edge));
-    return _seen.keys.toList();
+    _seen.removeWhere((_, seen) => seen.$1.isBefore(edge));
+    final ids = _seen.keys.toList()..sort((a, b) => _seen[b]!.$2.compareTo(_seen[a]!.$2));
+    return ids.take(_maxIds).toList();
   }
 
   Future<bool> start() async {
@@ -105,7 +109,7 @@ class Scanner {
         for (final result in results) {
           for (final uuid in result.advertisementData.serviceUuids) {
             final id = bleIdFromUuid(uuid.str128);
-            if (id != null) _seen[id] = DateTime.now();
+            if (id != null) _seen[id] = (DateTime.now(), result.rssi);
           }
         }
       }, onError: (_) {});

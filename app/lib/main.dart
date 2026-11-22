@@ -28,6 +28,8 @@ class QasyndaApp extends StatelessWidget {
         listenable: state,
         builder: (context, _) => MaterialApp(
           title: 'Qasynda',
+          // Через этот ключ блокировка закрывает экраны, открытые поверх главного.
+          navigatorKey: state.navigatorKey,
           debugShowCheckedModeBanner: false,
           theme: buildTheme(),
           locale: Locale(state.lang),

@@ -8,7 +8,9 @@
                поэтому знать его может только тот, кто физически рядом. Меняется каждые BLE_ROTATE
                секунд: по неизменной метке телефон можно было бы отслеживать, а услышанную однажды —
                предъявлять потом откуда угодно;
-- public_id  — сервер отдаёт его в результатах поиска, по нему отправляется перевод.
+- public_id  — сервер отдаёт его в результатах поиска, по нему отправляется перевод. Меняется вместе
+               с ble_id: иначе по нему можно было бы связать все сменяющиеся метки в одного человека.
+               Прежний принимается для перевода ещё PUBLIC_GRACE секунд — пока отправитель вводит сумму.
 """
 from __future__ import annotations
 
@@ -16,11 +18,12 @@ import math
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 BEACON_TTL = 45.0          # секунд без обновления до исчезновения маяка
 BLE_ROTATE = 30.0          # как часто меняется Bluetooth-метка
 BLE_GRACE = 20.0           # сколько принимается прежняя метка: отправитель помнит услышанное 12 секунд
+PUBLIC_GRACE = 180.0       # сколько принимается прежний public_id
 GPS_RADIUS_M = 75.0        # дальше этого по GPS «рядом» не считается
 MAX_ACCURACY_M = 100.0     # координаты с худшей точностью для поиска не используются
 MAX_SPEED_MPS = 30.0       # быстрее этого человек не перемещается: иначе координаты подставные
@@ -40,6 +43,7 @@ class Beacon:
     rotated_at: float = 0.0
     prev_ble_id: str | None = None
     prev_until: float = 0.0
+    old_public: list[tuple[str, float]] = field(default_factory=list)
 
     def ble_ids(self, now: float) -> list[str]:
         """Метки, которые сейчас подтверждают близость: текущая и, недолго после смены, прежняя."""
@@ -79,6 +83,8 @@ def upsert(user_id: int, lat: float | None, lon: float | None, accuracy: float |
         elif now - beacon.rotated_at >= BLE_ROTATE:
             beacon.prev_ble_id, beacon.prev_until = beacon.ble_id, now + BLE_GRACE
             beacon.ble_id, beacon.rotated_at = secrets.token_hex(8), now
+            beacon.old_public = [(p, t) for p, t in beacon.old_public if t > now] + [(beacon.public_id, now + PUBLIC_GRACE)]
+            beacon.public_id = secrets.token_hex(8)
         beacon.lat, beacon.lon, beacon.accuracy = lat, lon, accuracy
         beacon.expires = now + BEACON_TTL
         return beacon
@@ -91,8 +97,10 @@ def remove(user_id: int) -> None:
 
 def by_public(public_id: str) -> Beacon | None:
     with _lock:
-        _purge(clock())
-        return next((b for b in _by_user.values() if b.public_id == public_id), None)
+        now = clock()
+        _purge(now)
+        return next((b for b in _by_user.values()
+                     if b.public_id == public_id or any(p == public_id and t > now for p, t in b.old_public)), None)
 
 
 def by_ble(ble_ids: list[str]) -> list[Beacon]:

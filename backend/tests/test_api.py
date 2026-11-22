@@ -419,7 +419,7 @@ def test_logout_others(client):
 
 def test_unlock_checks_pin_and_closes_session_after_too_many_tries(client):
     me = auth(client, AIGERIM)
-    assert client.post("/auth/unlock", json={"pin": AIGERIM["pin"]}, headers=me).json() == {"ok": True}
+    assert client.post("/auth/unlock", json={"pin": AIGERIM["pin"]}, headers=me).json()["ok"] is True
     for _ in range(main.LOGIN_ATTEMPTS):
         r = client.post("/auth/unlock", json={"pin": "9999"}, headers=me)
         assert r.status_code == 403 and r.json()["detail"]["code"] == "invalid_pin"
@@ -575,7 +575,7 @@ def test_bluetooth_id_rotates_and_old_one_works_briefly(client, monkeypatch):
     real = nearby.clock
     monkeypatch.setattr(nearby, "clock", lambda: real() + nearby.BLE_ROTATE + 1)
     second = client.post("/nearby/beacon", json={}, headers=seller).json()
-    assert second["ble_id"] != first["ble_id"] and second["public_id"] == first["public_id"]
+    assert second["ble_id"] != first["ble_id"] and second["public_id"] != first["public_id"]
     people = client.post("/nearby/discover", json={"ble_ids": [first["ble_id"]]}, headers=buyer).json()["people"]
     assert [p["method"] for p in people] == ["bluetooth"]
     assert client.post("/transfers", json=bt_body(first), headers=buyer).status_code == 200
@@ -593,3 +593,112 @@ def test_mocked_location_is_ignored(client):
     assert r["gps"] == "ignored" and r["people"] == []
     mocked = client.post("/nearby/beacon", json={"location": {**HERE, "mocked": True}}, headers=seller).json()
     assert mocked["gps"] == "ignored"
+
+
+# --- проверка третьего агента: окно разблокировки, биометрия, адрес, метки ---
+
+def test_locked_session_cannot_move_money_or_see_balance(client):
+    seller, buyer = auth(client, MERCHANT), auth(client, AIGERIM)
+    beacon = client.post("/nearby/beacon", json={}, headers=seller).json()
+    assert client.post("/auth/lock", headers=buyer).json() == {"ok": True}
+    for method, path, body in [("get", "/me", None), ("get", "/transfers", None), ("get", "/devices", None),
+                               ("post", "/transfers", bt_body(beacon)), ("post", "/nearby/discover", {}),
+                               ("post", "/nearby/beacon", {}), ("post", "/devices/logout-others", None),
+                               ("post", "/auth/bio-key", None)]:
+        r = getattr(client, method)(path, headers=buyer, **({"json": body} if body is not None else {}))
+        assert r.status_code == 403 and r.json()["detail"]["code"] == "locked", path
+    assert client.post("/ws/ticket", headers=buyer).status_code == 200
+    assert client.post("/auth/unlock", json={"pin": AIGERIM["pin"]}, headers=buyer).status_code == 200
+    assert client.post("/transfers", json=bt_body(beacon), headers=buyer).status_code == 200
+
+
+def test_unlock_window_expires_and_slides(client, monkeypatch):
+    me = auth(client, AIGERIM)
+    real = db.time.time
+    monkeypatch.setattr(main.time, "time", lambda: real() + db.UNLOCK_TTL - 10)
+    assert client.get("/me", headers=me).status_code == 200      # действие продлевает окно
+    monkeypatch.setattr(main.time, "time", lambda: real() + 2 * db.UNLOCK_TTL - 30)
+    assert client.get("/me", headers=me).status_code == 200
+    monkeypatch.setattr(main.time, "time", lambda: real() + 4 * db.UNLOCK_TTL)
+    r = client.get("/me", headers=me)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "locked"
+
+
+def test_biometric_secret_unlocks_only_its_device(client):
+    mine = auth(client, AIGERIM)
+    other = auth(client, AIGERIM, secret=device(AIGERIM, 1))
+    secret = client.post("/auth/bio-key", headers=mine).json()["bio_secret"]
+    client.post("/auth/lock", headers=mine)
+    client.post("/auth/lock", headers=other)
+    assert client.post("/auth/unlock", json={"bio_secret": secret}, headers=other).json()["detail"]["code"] == "invalid_bio"
+    assert client.post("/auth/unlock", json={"bio_secret": secret}, headers=mine).status_code == 200
+    # новый ключ заменяет старый, отключение биометрии стирает его
+    fresh = client.post("/auth/bio-key", headers=mine).json()["bio_secret"]
+    client.post("/auth/lock", headers=mine)
+    assert client.post("/auth/unlock", json={"bio_secret": secret}, headers=mine).status_code == 403
+    assert client.delete("/auth/bio-key", headers=mine).status_code == 200
+    assert client.post("/auth/unlock", json={"bio_secret": fresh}, headers=mine).status_code == 403
+
+
+def test_unlock_needs_exactly_one_proof(client):
+    me = auth(client, AIGERIM)
+    assert client.post("/auth/unlock", json={}, headers=me).json()["detail"]["code"] == "pin_or_bio_required"
+    both = {"pin": AIGERIM["pin"], "bio_secret": "x" * 40}
+    assert client.post("/auth/unlock", json=both, headers=me).json()["detail"]["code"] == "pin_or_bio_required"
+
+
+def test_wrong_biometric_secrets_count_towards_session_revocation(client):
+    me = auth(client, AIGERIM)
+    for _ in range(main.LOGIN_ATTEMPTS):
+        assert client.post("/auth/unlock", json={"bio_secret": "y" * 43}, headers=me).status_code == 403
+    assert client.post("/auth/unlock", json={"pin": AIGERIM["pin"]}, headers=me).status_code == 401
+
+
+def test_without_ip_header_one_client_cannot_exhaust_a_shared_limit(client):
+    # За прокси хостинга у всех один адрес соединения: раньше 20 запросов закрывали SMS всем на час,
+    # а 50 неудачных подтверждений закрывали вход по PIN всем на 10 минут.
+    auth(client, DANIYAR)
+    pending = []
+    for i in range(25):
+        r = client.post("/auth/login", json={"phone": f"+7700{i:07d}", "pin": "1111", "device_secret": device(AIGERIM, i)})
+        assert r.status_code == 200, i
+        pending.append(r.json())
+    for p in pending:
+        for _ in range(3):
+            confirm(client, p, "1111", "123456")
+    assert login(client, MERCHANT).json().get("sms_required") is True
+    assert "token" in login(client, DANIYAR).json()
+
+
+def test_flood_of_bluetooth_ids_does_not_break_payment(client):
+    seller, buyer = auth(client, MERCHANT), auth(client, AIGERIM)
+    beacon = client.post("/nearby/beacon", json={}, headers=seller).json()
+    junk = [f"{i:016x}" for i in range(1, 200)]
+    people = client.post("/nearby/discover", json={"ble_ids": [beacon["ble_id"]] + junk}, headers=buyer).json()["people"]
+    assert [p["method"] for p in people] == ["bluetooth"]
+    body = {**bt_body(beacon), "ble_ids": [beacon["ble_id"]] + junk}
+    assert client.post("/transfers", json=body, headers=buyer).status_code == 200
+
+
+def test_public_id_rotates_with_bluetooth_id_and_old_one_still_pays(client, monkeypatch):
+    seller, buyer = auth(client, MERCHANT), auth(client, AIGERIM)
+    first = client.post("/nearby/beacon", json={}, headers=seller).json()
+    real = nearby.clock
+    monkeypatch.setattr(nearby, "clock", lambda: real() + nearby.BLE_ROTATE + 1)
+    second = client.post("/nearby/beacon", json={}, headers=seller).json()
+    assert second["public_id"] != first["public_id"]
+    people = client.post("/nearby/discover", json={"ble_ids": [second["ble_id"]]}, headers=buyer).json()["people"]
+    assert [p["public_id"] for p in people] == [second["public_id"]]
+    # отправитель ещё вводил сумму по старому public_id
+    assert client.post("/transfers", json={**bt_body(second), "public_id": first["public_id"]}, headers=buyer).status_code == 200
+    monkeypatch.setattr(nearby, "clock", lambda: real() + nearby.BLE_ROTATE + nearby.PUBLIC_GRACE + 5)
+    client.post("/nearby/beacon", json={}, headers=seller)
+    r = client.post("/transfers", json={**bt_body(second), "public_id": first["public_id"]}, headers=buyer)
+    assert r.status_code == 404
+
+
+def test_sms_code_is_never_logged(client, caplog):
+    import logging
+    caplog.set_level(logging.DEBUG)
+    code = login(client, AIGERIM).json()["demo_code"]
+    assert code not in caplog.text

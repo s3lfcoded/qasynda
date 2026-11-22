@@ -18,6 +18,9 @@ class Api {
   String? token;
   final _client = http.Client();
 
+  /// Сервер ответил, что сессия заблокирована: приложение должно показать экран блокировки.
+  void Function()? onLocked;
+
   Future<Map<String, dynamic>> get(String path) => _send('GET', path);
   Future<Map<String, dynamic>> post(String path, [Map<String, dynamic> body = const {}]) =>
       _send('POST', path, body);
@@ -49,6 +52,7 @@ class Api {
     }
     final detail = data is Map<String, dynamic> ? data['detail'] : null;
     if (detail is Map<String, dynamic> && detail['code'] is String) {
+      if (response.statusCode == 403 && detail['code'] == 'locked') onLocked?.call();
       throw ApiError(detail['code'] as String, response.statusCode, detail);
     }
     throw ApiError('unknown', response.statusCode);

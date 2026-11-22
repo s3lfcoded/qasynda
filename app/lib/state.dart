@@ -4,6 +4,7 @@ import 'dart:io' show Platform;
 import 'dart:math';
 
 import 'package:flutter/foundation.dart' show kReleaseMode;
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:material_ui/material_ui.dart';
@@ -32,10 +33,17 @@ class SmsChallenge {
 
 class AppState extends ChangeNotifier {
   final api = Api();
-  final _storage = const FlutterSecureStorage();
+  final navigatorKey = GlobalKey<NavigatorState>();
+  // «Только на этом устройстве»: токен и ключ телефона не попадают в резервную копию iPhone
+  // и не переезжают на другой телефон при восстановлении из неё.
+  final _storage = const FlutterSecureStorage(
+    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock_this_device),
+  );
   final _auth = LocalAuthentication();
   final _incoming = StreamController<Map<String, dynamic>>.broadcast();
   final _alerts = StreamController<Map<String, dynamic>>.broadcast();
+  final _pendingAlerts = <Map<String, dynamic>>[];
+  final _hidden = Stopwatch();
   late final AppLifecycleListener _life;
 
   String lang = 'ru';
@@ -55,28 +63,29 @@ class AppState extends ChangeNotifier {
   bool biometricEnabled = true;
   bool biometricAvailable = false;
 
-  DateTime? _hiddenAt;
   WebSocketChannel? _socket;
   Timer? _reconnect;
 
   AppState() {
+    api.onLocked = lockNow;
     _life = AppLifecycleListener(
       onInactive: () => _setCovered(true),
       onResume: () => _setCovered(false),
-      onHide: () => _hiddenAt = DateTime.now(),
+      // Время в фоне считается по монотонным часам: перевод часов на телефоне назад блокировку не отменит.
+      onHide: () => _hidden
+        ..reset()
+        ..start(),
       onShow: () {
-        final at = _hiddenAt;
-        _hiddenAt = null;
-        if (loggedIn && at != null && DateTime.now().difference(at) > _lockAfter) {
-          locked = true;
-          notifyListeners();
-        }
+        _hidden.stop();
+        if (loggedIn && _hidden.elapsed > _lockAfter) lockNow();
       },
     );
   }
 
   S get s => S(lang);
-  bool get loggedIn => api.token != null && profile != null;
+
+  /// В заблокированном приложении профиля может не быть: сервер отдаёт его только после разблокировки.
+  bool get loggedIn => api.token != null && (locked || profile != null);
 
   /// Входящие переводы в реальном времени.
   Stream<Map<String, dynamic>> get incoming => _incoming.stream;
@@ -84,11 +93,37 @@ class AppState extends ChangeNotifier {
   /// Предупреждения безопасности: вход в аккаунт с нового телефона.
   Stream<Map<String, dynamic>> get alerts => _alerts.stream;
 
+  /// Предупреждения, пришедшие, пока их некому было показать (например, пока приложение заблокировано).
+  List<Map<String, dynamic>> takePendingAlerts() {
+    final list = List.of(_pendingAlerts);
+    _pendingAlerts.clear();
+    return list;
+  }
+
   void _setCovered(bool value) {
     if (covered == value) return;
     covered = value && hideSensitive;
     notifyListeners();
   }
+
+  /// Хранилище секрета для биометрии: открывается только лицом или пальцем владельца.
+  /// На iPhone — Keychain с biometryCurrentSet, на Android — ключ Keystore только для сильной биометрии.
+  /// Код телефона его не открывает, а добавление нового пальца или лица делает его недействительным.
+  FlutterSecureStorage get _bioStorage => FlutterSecureStorage(
+        iOptions: const IOSOptions(
+          accountName: 'qasynda_bio',
+          accessibility: KeychainAccessibility.unlocked_this_device,
+          accessControlFlags: [AccessControlFlag.biometryCurrentSet],
+        ),
+        aOptions: AndroidOptions.biometric(
+          enforceBiometrics: true,
+          requireBiometricsPerOperation: true,
+          biometricType: AndroidBiometricType.strongBiometricOnly,
+          storageNamespace: 'qasynda_bio',
+          biometricPromptTitle: s.t('bioReason'),
+          biometricPromptNegativeButton: s.t('cancel'),
+        ),
+      );
 
   Future<String?> _read(String key) async {
     try {
@@ -116,9 +151,10 @@ class AppState extends ChangeNotifier {
     }
     api.token = await _read('token');
     if (api.token != null) {
+      // Блокировка ставится сразу, до любых запросов: ни сбой сети, ни ошибка сервера её не снимут.
+      locked = true;
       try {
-        await refresh();
-        locked = true;
+        await api.post('/auth/lock');
         _connect();
       } on ApiError catch (e) {
         if (e.status == 401) await _forget();
@@ -132,6 +168,18 @@ class AppState extends ChangeNotifier {
   void dispose() {
     _life.dispose();
     super.dispose();
+  }
+
+  /// Блокирует приложение: закрывает все открытые поверх главного экраны (перевод, настройки, приём)
+  /// и сообщает серверу, чтобы он тоже перестал пускать к переводам.
+  void lockNow() {
+    if (api.token == null) return;
+    navigatorKey.currentState?.popUntil((route) => route.isFirst);
+    if (!locked) {
+      locked = true;
+      notifyListeners();
+    }
+    api.post('/auth/lock').catchError((_) => <String, dynamic>{});
   }
 
   Future<void> setLang(String value) async {
@@ -156,6 +204,11 @@ class AppState extends ChangeNotifier {
     biometricEnabled = value;
     notifyListeners();
     await _write('bio', value ? '1' : '0');
+    if (value) {
+      await _enrollBiometrics();
+    } else {
+      await _dropBiometrics();
+    }
   }
 
   /// Секрет этого телефона. IMEI приложениям недоступен ни на iPhone, ни на новых Android,
@@ -194,15 +247,45 @@ class AppState extends ChangeNotifier {
   Future<void> _signedIn(String token) async {
     api.token = token;
     await _write('token', token);
+    await _write('bio_enrolled', null);
     locked = false;
     await refresh();
     _connect();
+    await _enrollBiometrics();
   }
 
   /// Разблокировка кодом: его проверяет сервер, после пяти ошибок сессия закрывается.
   Future<void> unlock(String pin) async {
+    await _unlockWith({'pin': pin});
+    await _enrollBiometrics();
+  }
+
+  /// Разблокировка Face ID или отпечатком: секрет достаётся из хранилища под биометрией и проверяется
+  /// сервером. false — человек отменил, биометрия изменилась или секрета ещё нет: тогда нужен PIN.
+  Future<bool> unlockWithBiometrics() async {
+    if (!biometricAvailable || !biometricEnabled || await _read('bio_enrolled') != '1') return false;
+    String? secret;
     try {
-      await api.post('/auth/unlock', {'pin': pin});
+      secret = await _bioStorage.read(key: 'bio_secret');
+    } on PlatformException {
+      return false;
+    }
+    if (secret == null) {
+      await _write('bio_enrolled', null);
+      return false;
+    }
+    try {
+      await _unlockWith({'bio_secret': secret});
+      return true;
+    } on ApiError catch (e) {
+      if (e.code == 'invalid_bio') await _write('bio_enrolled', null);
+      rethrow;
+    }
+  }
+
+  Future<void> _unlockWith(Map<String, dynamic> proof) async {
+    try {
+      await api.post('/auth/unlock', proof);
     } on ApiError catch (e) {
       if (e.status == 401) {
         await _forget();
@@ -212,21 +295,30 @@ class AppState extends ChangeNotifier {
     }
     locked = false;
     notifyListeners();
+    await refresh().catchError((_) {});
   }
 
-  /// Разблокировка Face ID или отпечатком. false — человек отменил или биометрия недоступна.
-  Future<bool> unlockWithBiometrics() async {
-    if (!biometricAvailable || !biometricEnabled) return false;
+  /// Привязывает биометрию к этому телефону: сервер выдаёт секрет, приложение кладёт его
+  /// в хранилище под биометрией. Делается из разблокированной сессии, один раз.
+  Future<void> _enrollBiometrics() async {
+    if (!biometricAvailable || !biometricEnabled || locked || await _read('bio_enrolled') == '1') return;
     try {
-      final ok = await _auth.authenticate(localizedReason: s.t('bioReason'), persistAcrossBackgrounding: true);
-      if (ok) {
-        locked = false;
-        notifyListeners();
-      }
-      return ok;
-    } on LocalAuthException {
-      return false;
+      final secret = (await api.post('/auth/bio-key'))['bio_secret'] as String;
+      await _bioStorage.write(key: 'bio_secret', value: secret);
+      await _write('bio_enrolled', '1');
+    } catch (_) {
+      await _dropBiometrics();
     }
+  }
+
+  Future<void> _dropBiometrics() async {
+    await _write('bio_enrolled', null);
+    try {
+      await _bioStorage.delete(key: 'bio_secret');
+    } catch (_) {}
+    try {
+      await api.delete('/auth/bio-key');
+    } catch (_) {}
   }
 
   Future<void> logout() async {
@@ -253,6 +345,10 @@ class AppState extends ChangeNotifier {
     history = [];
     locked = false;
     await _write('token', null);
+    await _write('bio_enrolled', null);
+    try {
+      await _bioStorage.delete(key: 'bio_secret');
+    } catch (_) {}
   }
 
   Future<void> refresh() async {
@@ -322,9 +418,14 @@ class AppState extends ChangeNotifier {
     if (event['type'] == 'transfer_received') {
       if (event['balance'] is int) setBalance(event['balance'] as int);
       _incoming.add(event);
-      refresh().catchError((_) {});
+      if (!locked) refresh().catchError((_) {});
     } else if (event['type'] == 'new_device') {
-      _alerts.add(event);
+      // Пока приложение заблокировано, главного экрана нет и показать некому: предупреждение ждёт.
+      if (_alerts.hasListener && !locked) {
+        _alerts.add(event);
+      } else {
+        _pendingAlerts.add(event);
+      }
     }
   }
 }

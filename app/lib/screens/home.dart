@@ -31,17 +31,26 @@ class _HomeScreenState extends State<HomeScreen> {
       // На экране приёма перевод показывается крупно, здесь — короткое уведомление.
       if (!mounted || ModalRoute.of(context)?.isCurrent != true) return;
       showError(context,
-          '${app.s.t('received', {'sum': money(event['amount'] as int)})} · ${app.s.t('from', {'name': '${event['sender']}'})}');
+          // при скрытии сумм уведомление не показывает сумму: его видно и на скриншоте, и через плечо
+          '${app.hideSensitive ? app.s.t('receivedHidden') : app.s.t('received', {'sum': money(event['amount'] as int)})} · ${app.s.t('from', {'name': '${event['sender']}'})}');
     });
     // Вход с другого телефона видно сразу, на любом экране.
-    _alerts ??= app.alerts.listen((event) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        duration: const Duration(seconds: 10),
-        content: Text(app.s.t('newDevice', {'name': '${event['name']}'})),
-        action: SnackBarAction(label: app.s.t('settings'), onPressed: () => _open(const SettingsScreen())),
-      ));
-    });
+    if (_alerts == null) {
+      _alerts = app.alerts.listen(_showAlert);
+      // Предупреждения, пришедшие, пока приложение было заблокировано.
+      final pending = app.takePendingAlerts();
+      if (pending.isNotEmpty) WidgetsBinding.instance.addPostFrameCallback((_) => pending.forEach(_showAlert));
+    }
+  }
+
+  void _showAlert(Map<String, dynamic> event) {
+    if (!mounted) return;
+    final app = AppScope.of(context);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      duration: const Duration(seconds: 10),
+      content: Text(app.s.t('newDevice', {'name': '${event['name']}'})),
+      action: SnackBarAction(label: app.s.t('settings'), onPressed: () => _open(const SettingsScreen())),
+    ));
   }
 
   @override
