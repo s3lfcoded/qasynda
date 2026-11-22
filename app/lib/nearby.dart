@@ -29,7 +29,13 @@ Future<Map<String, dynamic>?> currentLocation() async {
     final p = await Geolocator.getCurrentPosition(
       locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, timeLimit: Duration(seconds: 8)),
     );
-    return {'lat': p.latitude, 'lon': p.longitude, 'accuracy': p.accuracy.clamp(0, 10000).toDouble()};
+    // isMocked: Android помечает координаты из программ подмены местоположения, сервер такие не принимает.
+    return {
+      'lat': p.latitude,
+      'lon': p.longitude,
+      'accuracy': p.accuracy.clamp(0, 10000).toDouble(),
+      'mocked': p.isMocked,
+    };
   } catch (_) {
     return null;
   }

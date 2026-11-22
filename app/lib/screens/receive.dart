@@ -29,6 +29,7 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
   bool _online = true;
   bool _checked = false; // Bluetooth и геолокация уже опрошены: до этого предупреждение не показываем
   Map<String, dynamic>? _last;
+  String? _bleId;
 
   @override
   void didChangeDependencies() {
@@ -45,18 +46,23 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
   }
 
   Future<void> _begin() async {
-    final bleId = await _beat();
+    await _advertise(await _beat());
     if (!mounted) return;
-    if (bleId != null) {
-      final ok = await _advertiser.start(bleId);
-      if (!mounted) {
-        await _advertiser.stop();
-        return;
-      }
-      setState(() => _bluetooth = ok);
-    }
     setState(() => _checked = true);
-    _timer = Timer.periodic(const Duration(seconds: 15), (_) => _beat());
+    _timer = Timer.periodic(const Duration(seconds: 15), (_) async => _advertise(await _beat()));
+  }
+
+  /// Сервер периодически выдаёт новую Bluetooth-метку: старую перестаём транслировать.
+  Future<void> _advertise(String? bleId) async {
+    if (!mounted || bleId == null || bleId == _bleId) return;
+    if (_bleId != null) await _advertiser.stop();
+    _bleId = bleId;
+    final ok = await _advertiser.start(bleId);
+    if (!mounted) {
+      await _advertiser.stop();
+      return;
+    }
+    setState(() => _bluetooth = ok);
   }
 
   /// Продлевает маяк на сервере. Возвращает идентификатор для трансляции по Bluetooth.

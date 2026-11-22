@@ -7,16 +7,17 @@ import hmac
 import os
 import re
 import secrets
+import threading
 import time
 import unicodedata
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import db, guard, nearby
+from . import db, guard, nearby, sms
 
 # Лимит одного перевода в тиынах. Близость по Bluetooth подделать труднее, чем координаты,
 # поэтому перевод только по GPS ограничен жёстче.
@@ -30,14 +31,24 @@ MIN_AMOUNT = 100_00
 DAILY_LIMIT = 2_000_000_00
 DAILY_LIMIT_GPS = 150_000_00
 
-# Вход: 5 неудачных попыток на номер за 5 минут и 15 за сутки. С 4-значным PIN это больше года
-# перебора на один номер. Попытка записывается до проверки PIN — параллельные запросы лимит не обходят.
+# PIN: 5 неудачных попыток на номер за 5 минут и 15 за сутки. Попытка записывается до проверки PIN —
+# параллельные запросы лимит не обходят. Счётчики раздельные для входа с привязанного телефона,
+# для подтверждения нового телефона и для разблокировки приложения: чужие попытки с нового телефона
+# не должны закрывать вход владельцу.
 LOGIN_ATTEMPTS = 5
 _login_short = guard.Window(LOGIN_ATTEMPTS, 300)
 _login_long = guard.Window(15, 24 * 3600)
+_unlock_rate = guard.Window(LOGIN_ATTEMPTS, 900)
 # Перебор одного PIN по многим номерам ограничивается по адресу клиента — если сервер знает его настоящий адрес.
 _login_ip = guard.Window(50, 600)
 IP_HEADER = os.environ.get("QASYNDA_IP_HEADER", "").strip().lower()
+
+# Вход с нового телефона подтверждается кодом из SMS. SMS стоят денег и ими можно засыпать человека,
+# поэтому их число ограничено и по номеру, и по адресу.
+SMS_TTL = 300.0
+SMS_ATTEMPTS = 5
+_sms_phone = guard.Window(3, 3600)
+_sms_ip = guard.Window(20, 3600)
 
 _discover_rate = guard.Window(40, 60)        # приложение спрашивает раз в 2 секунды — 30 в минуту
 _beacon_rate = guard.Window(12, 60)          # приложение продлевает маяк раз в 15 секунд
@@ -46,16 +57,31 @@ _transfer_rate = guard.Window(10, 60)
 _pair_rate = guard.Window(3, 600)            # одному и тому же получателю
 
 HexId = Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")]
+DeviceSecret = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{32,128}$")]
 
 
 class Location(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
     accuracy: float = Field(ge=0, le=10_000)
+    # Android сам помечает координаты из программ подмены местоположения.
+    mocked: bool = False
 
 
 class LoginIn(BaseModel):
     phone: str = Field(pattern=r"^\+7\d{10}$")
+    pin: str = Field(pattern=r"^\d{4,6}$")
+    device_secret: DeviceSecret
+    device_name: str = Field(default="Телефон", min_length=1, max_length=60)
+
+
+class ConfirmIn(BaseModel):
+    challenge: str = Field(pattern=r"^[A-Za-z0-9_-]{16,64}$")
+    code: str = Field(pattern=r"^\d{6}$")
+    pin: str = Field(pattern=r"^\d{4,6}$")
+
+
+class UnlockIn(BaseModel):
     pin: str = Field(pattern=r"^\d{4,6}$")
 
 
@@ -98,32 +124,55 @@ def clean_note(note: str | None) -> str | None:
 
 
 class Hub:
-    """Открытые WebSocket-соединения по пользователям: мгновенное уведомление о переводе."""
+    """Открытые WebSocket-соединения: мгновенное уведомление о переводе и закрытие при выходе с устройства.
+
+    Обычные (не async) обработчики работают в пуле потоков, поэтому отправка всегда передаётся
+    в цикл событий сервера через loop.call_soon_threadsafe."""
 
     MAX_PER_USER = 3
     SEND_TIMEOUT = 2.0
 
     def __init__(self) -> None:
-        self._sockets: dict[int, list[WebSocket]] = {}
+        self._sockets: dict[int, list[tuple[WebSocket, str | None]]] = {}
         self._tasks: set[asyncio.Task] = set()
+        self.loop: asyncio.AbstractEventLoop | None = None
 
-    def add(self, user_id: int, sock: WebSocket) -> None:
+    def add(self, user_id: int, device_id: str | None, sock: WebSocket) -> None:
         sockets = self._sockets.setdefault(user_id, [])
-        sockets.append(sock)
+        sockets.append((sock, device_id))
         while len(sockets) > self.MAX_PER_USER:
-            self._spawn(self._close(sockets.pop(0)))
+            self._run(self._close(sockets.pop(0)[0]))
 
     def remove(self, user_id: int, sock: WebSocket) -> None:
         sockets = self._sockets.get(user_id)
-        if sockets and sock in sockets:
-            sockets.remove(sock)
+        if sockets:
+            sockets[:] = [entry for entry in sockets if entry[0] is not sock]
             if not sockets:
                 del self._sockets[user_id]
 
-    def notify(self, user_id: int, event: dict) -> None:
+    def notify(self, user_id: int, event: dict, skip_device: str | None = None) -> None:
         """Отправляет в фоне: медленный получатель не задерживает ответ отправителю."""
-        for sock in list(self._sockets.get(user_id, ())):
-            self._spawn(self._send(user_id, sock, event))
+        for sock, device_id in list(self._sockets.get(user_id, ())):
+            if skip_device is None or device_id != skip_device:
+                self._run(self._send(user_id, sock, event))
+
+    def kick(self, user_id: int, device_ids: list[str]) -> None:
+        """Закрывает соединения устройств, с которых пользователь вышел или которые отвязал."""
+        for sock, device_id in list(self._sockets.get(user_id, ())):
+            if device_id in device_ids:
+                self.remove(user_id, sock)
+                self._run(self._close(sock))
+
+    def _run(self, coro) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            if self.loop is None:
+                coro.close()
+                return
+            self.loop.call_soon_threadsafe(self._spawn, coro)
+            return
+        self._spawn(coro)
 
     def _spawn(self, coro) -> None:
         task = asyncio.get_running_loop().create_task(coro)
@@ -147,29 +196,52 @@ class Hub:
 
 hub = Hub()
 
-# Одноразовые пропуска для WebSocket: выдаются по токену сессии, живут 30 секунд, хранятся хешами.
+
+def _sha(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+class _Expiring:
+    """Короткоживущие одноразовые записи в памяти (пропуска WebSocket, SMS-запросы), хранятся по хешу ключа."""
+
+    def __init__(self, ttl: float, max_items: int = 50_000) -> None:
+        self.ttl, self.max_items = ttl, max_items
+        self._items: dict[str, tuple[float, dict]] = {}
+        self._lock = threading.Lock()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    def put(self, value: dict) -> str:
+        key = secrets.token_urlsafe(24)
+        now = time.monotonic()
+        with self._lock:
+            for h in [h for h, (exp, _) in self._items.items() if exp <= now]:
+                del self._items[h]
+            while len(self._items) >= self.max_items:
+                del self._items[next(iter(self._items))]
+            self._items[_sha(key)] = (now + self.ttl, value)
+        return key
+
+    def get(self, key: str) -> dict | None:
+        with self._lock:
+            entry = self._items.get(_sha(key))
+            if entry is None or entry[0] <= time.monotonic():
+                self._items.pop(_sha(key), None)
+                return None
+            return entry[1]
+
+    def pop(self, key: str) -> dict | None:
+        with self._lock:
+            entry = self._items.pop(_sha(key), None)
+        return entry[1] if entry and entry[0] > time.monotonic() else None
+
+
+# Одноразовые пропуска для WebSocket: выдаются по токену сессии и живут 30 секунд.
 TICKET_TTL = 30.0
-_tickets: dict[str, tuple[int, float]] = {}
-
-
-def _ticket_hash(ticket: str) -> str:
-    return hashlib.sha256(ticket.encode()).hexdigest()
-
-
-def issue_ticket(user_id: int) -> str:
-    now = time.monotonic()
-    for h in [h for h, (_, exp) in _tickets.items() if exp <= now]:
-        _tickets.pop(h, None)
-    ticket = secrets.token_urlsafe(24)
-    _tickets[_ticket_hash(ticket)] = (user_id, now + TICKET_TTL)
-    return ticket
-
-
-def redeem_ticket(ticket: str) -> int | None:
-    entry = _tickets.pop(_ticket_hash(ticket), None) if ticket else None
-    if entry is None or entry[1] <= time.monotonic():
-        return None
-    return entry[0]
+_tickets = _Expiring(TICKET_TTL)
+_challenges = _Expiring(SMS_TTL)
 
 
 @asynccontextmanager
@@ -177,7 +249,9 @@ async def lifespan(_: FastAPI):
     db.init()
     if os.environ.get("QASYNDA_SEED_DEMO") == "1":
         db.seed_demo()
+    hub.loop = asyncio.get_running_loop()
     yield
+    hub.loop = None
 
 
 app = FastAPI(title="Qasynda", lifespan=lifespan)
@@ -193,9 +267,13 @@ def fail(status: int, code: str, **extra) -> HTTPException:
     return HTTPException(status, detail={"code": code, **extra})
 
 
+def wait_error(code: str, wait: float) -> HTTPException:
+    seconds = int(wait) + 1
+    return HTTPException(429, detail={"code": code, "retry_after": seconds}, headers={"Retry-After": str(seconds)})
+
+
 def slow_down(wait: float) -> HTTPException:
-    return HTTPException(429, detail={"code": "slow_down", "retry_after": int(wait) + 1},
-                         headers={"Retry-After": str(int(wait) + 1)})
+    return wait_error("slow_down", wait)
 
 
 def _bearer(authorization: str | None) -> str:
@@ -215,7 +293,7 @@ User = Annotated[dict, Depends(current_user)]
 
 
 def client_ip(request: Request) -> str | None:
-    """Адрес клиента для ограничения входа. За прокси сокет показывает адрес прокси, а X-Forwarded-For
+    """Адрес клиента для ограничений. За прокси сокет показывает адрес прокси, а X-Forwarded-For
     клиент может подделать, поэтому заголовок с настоящим адресом задаётся явно (QASYNDA_IP_HEADER)."""
     if IP_HEADER:
         value = request.headers.get(IP_HEADER, "").split(",")[0].strip()
@@ -223,10 +301,26 @@ def client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
+def pin_gate(key: object, ip: str | None) -> list[tuple[guard.Window, object]]:
+    gates: list[tuple[guard.Window, object]] = [(_login_short, key), (_login_long, key)]
+    if ip:
+        gates.append((_login_ip, ip))
+    if wait := guard.take_all(gates):
+        raise wait_error("too_many_attempts", wait)
+    return gates
+
+
+def pin_passed(key: object, gates: list[tuple[guard.Window, object]]) -> None:
+    """PIN верный: короткое окно обнуляется, а эта попытка не засчитывается в суточный лимит и лимит адреса."""
+    _login_short.clear(key)
+    for window, key in gates[1:]:
+        window.refund(key)
+
+
 def trusted_location(user_id: int, loc: Location | None) -> tuple[Location | None, str]:
     if loc is None:
         return None, "off"
-    if not nearby.plausible(user_id, loc.lat, loc.lon, loc.accuracy):
+    if loc.mocked or not nearby.plausible(user_id, loc.lat, loc.lon, loc.accuracy):
         return None, "ignored"
     return loc, "ok"
 
@@ -260,22 +354,79 @@ def health() -> dict:
 
 @app.post("/auth/login")
 def login(body: LoginIn, request: Request) -> dict:
-    gates: list[tuple[guard.Window, object]] = [(_login_short, body.phone), (_login_long, body.phone)]
+    """Вход. С привязанного телефона — по PIN. С нового телефона PIN даже не проверяется, пока не введён
+    код из SMS: иначе перебор PIN с чужого устройства продолжал бы работать, а ответ «нужно SMS»
+    подсказывал бы, что PIN угадан. Ответ для несуществующего номера такой же, как для настоящего."""
     ip = client_ip(request)
+    gates = pin_gate(body.phone, ip)
+    user = db.user_by_phone(body.phone)
+    device = db.device_of(user["id"], body.device_secret) if user else None
+    if device:
+        if not db.check_pin(user, body.pin):
+            raise fail(401, "invalid_credentials")
+        pin_passed(body.phone, gates)
+        return {"token": db.create_session(user["id"], device["id"])}
+
+    for window, key in gates:
+        window.refund(key)
+    sms_gates: list[tuple[guard.Window, object]] = [(_sms_phone, body.phone)]
     if ip:
-        gates.append((_login_ip, ip))
-    wait = guard.take_all(gates)
-    if wait:
-        raise HTTPException(429, detail={"code": "too_many_attempts", "retry_after": int(wait) + 1},
-                            headers={"Retry-After": str(int(wait) + 1)})
-    token = db.login(body.phone, body.pin)
-    if not token:
+        sms_gates.append((_sms_ip, ip))
+    if wait := guard.take_all(sms_gates):
+        raise wait_error("too_many_sms", wait)
+    code = f"{secrets.randbelow(10**6):06d}"
+    challenge = _challenges.put({
+        "phone": body.phone, "user_id": user["id"] if user else None, "code": _sha(code),
+        "device_secret": body.device_secret, "device_name": body.device_name, "attempts": 0,
+    })
+    if user:
+        sms.send(body.phone, f"Qasynda: код входа с нового телефона {code}. Никому его не сообщайте.")
+    reply = {"sms_required": True, "challenge": challenge, "ttl": SMS_TTL}
+    if sms.demo():
+        reply["demo_code"] = code
+    return reply
+
+
+@app.post("/auth/confirm")
+def confirm(body: ConfirmIn, request: Request) -> dict:
+    """Второй шаг входа с нового телефона: код из SMS и PIN вместе. Ошибка одна на оба поля,
+    чтобы по ответу нельзя было понять, что из них верно."""
+    pending = _challenges.get(body.challenge)
+    if pending is None:
+        raise fail(401, "challenge_expired")
+    key = ("new_device", pending["phone"])
+    gates = pin_gate(key, client_ip(request))
+    pending["attempts"] += 1
+    user = db.user_by_id(pending["user_id"]) if pending["user_id"] else None
+    code_ok = hmac.compare_digest(_sha(body.code), pending["code"])
+    pin_ok = db.check_pin(user, body.pin)
+    if not (code_ok and pin_ok and user):
+        if pending["attempts"] >= SMS_ATTEMPTS:
+            _challenges.pop(body.challenge)
+            raise fail(401, "challenge_expired")
         raise fail(401, "invalid_credentials")
-    _login_short.clear(body.phone)
-    _login_long.refund(body.phone)
-    if ip:
-        _login_ip.refund(ip)
-    return {"token": token}
+    if _challenges.pop(body.challenge) is None:
+        raise fail(401, "challenge_expired")
+    pin_passed(key, gates)
+    device_id = db.add_device(user["id"], pending["device_secret"], pending["device_name"])
+    hub.notify(user["id"], {"type": "new_device", "name": pending["device_name"]}, skip_device=device_id)
+    return {"token": db.create_session(user["id"], device_id)}
+
+
+@app.post("/auth/unlock")
+def unlock(body: UnlockIn, request: Request, user: User,
+           authorization: Annotated[str | None, Header()] = None) -> dict:
+    """Код при открытии приложения проверяет сервер, с теми же лимитами, что и вход.
+    Когда попытки кончаются, сессия закрывается: дальше только полный вход."""
+    key = ("unlock", user["id"], user["session_device"])
+    if not _unlock_rate.take(key):
+        db.logout(_bearer(authorization))
+        _unlock_rate.clear(key)
+        raise fail(401, "unauthorized")
+    if not db.check_pin(user, body.pin):
+        raise fail(403, "invalid_pin")
+    _unlock_rate.clear(key)
+    return {"ok": True}
 
 
 @app.post("/auth/logout")
@@ -285,6 +436,29 @@ def logout(user: User, authorization: Annotated[str | None, Header()] = None) ->
     return {"ok": True}
 
 
+@app.get("/devices")
+def devices(user: User) -> dict:
+    return {"items": [{**d, "current": d["id"] == user["session_device"]} for d in db.devices(user["id"])]}
+
+
+@app.delete("/devices/{device_id}")
+def remove_device(device_id: Annotated[str, Path(pattern=r"^[0-9a-f]{16}$")], user: User) -> dict:
+    """Отвязать устройство: его сессии закрываются, а вход с него снова потребует SMS."""
+    removed = db.remove_devices(user["id"], [device_id])
+    if not removed:
+        raise fail(404, "device_not_found")
+    hub.kick(user["id"], removed)
+    return {"ok": True}
+
+
+@app.post("/devices/logout-others")
+def logout_others(user: User) -> dict:
+    others = [d["id"] for d in db.devices(user["id"]) if d["id"] != user["session_device"]]
+    removed = db.remove_devices(user["id"], others)
+    hub.kick(user["id"], removed)
+    return {"removed": len(removed)}
+
+
 @app.get("/me")
 def me(user: User) -> dict:
     return profile(user)
@@ -292,7 +466,8 @@ def me(user: User) -> dict:
 
 @app.post("/nearby/beacon")
 def beacon_on(body: BeaconIn, user: User) -> dict:
-    """Экран «Принять рядом» открыт. Клиент повторяет запрос каждые ~15 секунд, пока экран открыт."""
+    """Экран «Принять рядом» открыт. Клиент повторяет запрос каждые ~15 секунд, пока экран открыт;
+    Bluetooth-метка в ответе периодически меняется, и приложение начинает транслировать новую."""
     if wait := guard.take_all([(_beacon_rate, user["id"])]):
         raise slow_down(wait)
     loc, gps = trusted_location(user["id"], body.location)
@@ -350,7 +525,8 @@ async def transfer(body: TransferIn, user: User) -> dict:
     # Способ подтверждения близости определяет сервер, а не клиент.
     # Клиент присылает все маяки, которые сейчас слышит по Bluetooth; какой из них чей, знает только сервер.
     loc, _ = trusted_location(user["id"], body.location)
-    if any(hmac.compare_digest(seen, beacon.ble_id) for seen in body.ble_ids):
+    valid = beacon.ble_ids(nearby.clock())
+    if any(hmac.compare_digest(seen, ble) for seen in body.ble_ids for ble in valid):
         method, limit = "bluetooth", LIMIT_BLUETOOTH
     elif loc and nearby.gps_distance(beacon, loc.lat, loc.lon, loc.accuracy) is not None:
         method, limit = "gps", LIMIT_GPS
@@ -405,7 +581,8 @@ def transfers(user: User, limit: Annotated[int, Query(ge=1, le=100)] = 30) -> di
 
 @app.post("/ws/ticket")
 def ws_ticket(user: User) -> dict:
-    return {"ticket": issue_ticket(user["id"]), "ttl": TICKET_TTL}
+    return {"ticket": _tickets.put({"user_id": user["id"], "device_id": user["session_device"]}),
+            "ttl": TICKET_TTL}
 
 
 @app.websocket("/ws")
@@ -413,12 +590,12 @@ async def ws(sock: WebSocket, ticket: str = "") -> None:
     """Пропуск проверяется до того, как соединение принято: без него сервер сразу отвечает отказом
     и не держит открытым ни одного чужого соединения. Пропуск одноразовый и живёт 30 секунд,
     поэтому его появление в журналах адресов ничего не даёт."""
-    user_id = redeem_ticket(ticket)
-    if user_id is None:
+    entry = _tickets.pop(ticket) if ticket else None
+    if entry is None:
         await sock.close(code=4401)
         return
     await sock.accept()
-    hub.add(user_id, sock)
+    hub.add(entry["user_id"], entry["device_id"], sock)
     await sock.send_json({"type": "ready"})
     try:
         while True:
@@ -426,4 +603,4 @@ async def ws(sock: WebSocket, ticket: str = "") -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        hub.remove(user_id, sock)
+        hub.remove(entry["user_id"], sock)

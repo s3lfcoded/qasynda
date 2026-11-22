@@ -10,6 +10,7 @@ import '../theme.dart';
 import '../widgets.dart';
 import 'receive.dart';
 import 'send.dart';
+import 'settings.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -20,6 +21,7 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription<Map<String, dynamic>>? _sub;
+  StreamSubscription<Map<String, dynamic>>? _alerts;
 
   @override
   void didChangeDependencies() {
@@ -31,11 +33,21 @@ class _HomeScreenState extends State<HomeScreen> {
       showError(context,
           '${app.s.t('received', {'sum': money(event['amount'] as int)})} · ${app.s.t('from', {'name': '${event['sender']}'})}');
     });
+    // Вход с другого телефона видно сразу, на любом экране.
+    _alerts ??= app.alerts.listen((event) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        duration: const Duration(seconds: 10),
+        content: Text(app.s.t('newDevice', {'name': '${event['name']}'})),
+        action: SnackBarAction(label: app.s.t('settings'), onPressed: () => _open(const SettingsScreen())),
+      ));
+    });
   }
 
   @override
   void dispose() {
     _sub?.cancel();
+    _alerts?.cancel();
     super.dispose();
   }
 
@@ -76,34 +88,40 @@ class _HomeScreenState extends State<HomeScreen> {
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700, height: 1.15)),
-                      Text('${profile['phone']}',
-                          style: const TextStyle(fontSize: 13, color: Q.muted, fontFeatures: Q.tabular)),
+                      Sensitive(
+                        builder: (_, shown) => Text(shown ? '${profile['phone']}' : '+7 $masked ${'${profile['phone']}'.substring(10)}',
+                            style: const TextStyle(fontSize: 13, color: Q.muted, fontFeatures: Q.tabular)),
+                      ),
                     ]),
                   ),
                   const LangToggle(),
                   const SizedBox(width: 4),
                   IconButton(
-                    tooltip: s.t('logout'),
-                    onPressed: app.logout,
-                    icon: const Icon(Icons.logout_rounded, color: Q.muted, size: 22),
+                    tooltip: s.t('settings'),
+                    onPressed: () => _open(const SettingsScreen()),
+                    icon: const Icon(Icons.settings_outlined, color: Q.muted, size: 22),
                   ),
                 ]),
                 const SizedBox(height: 28),
                 Text(s.t('balance').toUpperCase(),
                     style: const TextStyle(fontSize: 12, color: Q.muted, fontWeight: FontWeight.w700, letterSpacing: 1.4)),
                 const SizedBox(height: 4),
-                FittedBox(
-                  fit: BoxFit.scaleDown,
-                  alignment: Alignment.centerLeft,
-                  child: Text(money(profile['balance'] as int),
-                      style: const TextStyle(
-                          fontSize: 46, fontWeight: FontWeight.w800, height: 1.1, letterSpacing: -1.2, fontFeatures: Q.tabular)),
+                Sensitive(
+                  builder: (_, shown) => FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Text(shown ? money(profile['balance'] as int) : '$masked ₸',
+                        style: const TextStyle(
+                            fontSize: 46, fontWeight: FontWeight.w800, height: 1.1, letterSpacing: -1.2, fontFeatures: Q.tabular)),
+                  ),
                 ),
                 const SizedBox(height: 20),
-                BankCard(
-                  holder: name,
-                  last4: '${profile['card_last4'] ?? '0000'}',
-                  business: merchant ? '${profile['business_name']}' : null,
+                Sensitive(
+                  builder: (_, shown) => BankCard(
+                    holder: name,
+                    last4: shown ? '${profile['card_last4'] ?? '0000'}' : masked,
+                    business: merchant ? '${profile['business_name']}' : null,
+                  ),
                 ),
                 const SizedBox(height: 12),
                 IntrinsicHeight(
@@ -237,9 +255,11 @@ class _HistoryRow extends StatelessWidget {
           ]),
         ),
         const SizedBox(width: 10),
-        Text('${incoming ? '+' : '−'}${money(item['amount'] as int)}',
-            style: TextStyle(
-                fontSize: 15.5, fontWeight: FontWeight.w700, color: incoming ? Q.ok : Q.text, fontFeatures: Q.tabular)),
+        Sensitive(
+          builder: (_, shown) => Text('${incoming ? '+' : '−'}${shown ? money(item['amount'] as int) : '$masked ₸'}',
+              style: TextStyle(
+                  fontSize: 15.5, fontWeight: FontWeight.w700, color: incoming ? Q.ok : Q.text, fontFeatures: Q.tabular)),
+        ),
       ]),
     );
   }

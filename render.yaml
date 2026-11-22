@@ -17,3 +17,7 @@ services:
         value: 3.11.9
       - key: QASYNDA_SEED_DEMO
         value: "1"
+      # Учебные SMS: код входа с нового телефона приходит в ответе сервера и показывается в приложении.
+      # Для настоящей рассылки убрать и подключить шлюз в backend/app/sms.py.
+      - key: QASYNDA_SMS_DEMO
+        value: "1"

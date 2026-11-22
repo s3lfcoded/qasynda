@@ -19,18 +19,36 @@ ASTANA = {"lat": 51.1280, "lon": 71.4300, "accuracy": 5}     # ~920 км от HE
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("QASYNDA_DB", str(tmp_path / "test.db"))
     monkeypatch.setenv("QASYNDA_SEED_DEMO", "1")
+    monkeypatch.setenv("QASYNDA_SMS_DEMO", "1")
     monkeypatch.setattr(db, "PBKDF2_ROUNDS", 1000)
     nearby.reset()
     guard.reset()
     main._tickets.clear()
+    main._challenges.clear()
     with TestClient(main.app) as c:
         yield c
 
 
-def auth(client, user):
-    r = client.post("/auth/login", json={"phone": user["phone"], "pin": user["pin"]})
+def device(user, n=0):
+    return f"test-device-{user['phone'][1:]}-{n:010d}"
+
+
+def login(client, user, pin=None, secret=None, **kw):
+    return client.post("/auth/login", json={"phone": user["phone"], "pin": pin or user["pin"],
+                                            "device_secret": secret or device(user), "device_name": "Тест"}, **kw)
+
+
+def auth(client, user, secret=None):
+    """Вход: с нового устройства — через учебное SMS, с привязанного — сразу."""
+    r = login(client, user, secret=secret)
     assert r.status_code == 200, r.text
-    return {"Authorization": f"Bearer {r.json()['token']}"}
+    data = r.json()
+    if data.get("sms_required"):
+        r = client.post("/auth/confirm", json={"challenge": data["challenge"], "code": data["demo_code"],
+                                               "pin": user["pin"]})
+        assert r.status_code == 200, r.text
+        data = r.json()
+    return {"Authorization": f"Bearer {data['token']}"}
 
 
 def key():
@@ -52,12 +70,11 @@ def ws_url(client, headers):
 
 
 def test_login_rejects_wrong_pin_and_throttles(client):
-    bad = {"phone": AIGERIM["phone"], "pin": "9999"}
+    auth(client, AIGERIM)
     for _ in range(main.LOGIN_ATTEMPTS):
-        assert client.post("/auth/login", json=bad).status_code == 401
-    assert client.post("/auth/login", json=bad).status_code == 429
-    good = {"phone": AIGERIM["phone"], "pin": AIGERIM["pin"]}
-    assert client.post("/auth/login", json=good).status_code == 429
+        assert login(client, AIGERIM, pin="9999").status_code == 401
+    assert login(client, AIGERIM, pin="9999").status_code == 429
+    assert login(client, AIGERIM).status_code == 429
 
 
 def test_profile_has_card_but_strangers_do_not_see_it(client):
@@ -246,10 +263,11 @@ def test_websocket_keeps_few_connections_per_user(client):
 # --- вход ---
 
 def test_parallel_login_attempts_do_not_bypass_limit(client, monkeypatch):
+    auth(client, AIGERIM)
     monkeypatch.setattr(db, "PBKDF2_ROUNDS", 20_000)  # проверка PIN длится заметное время, как в жизни
 
     def attempt(i):
-        return client.post("/auth/login", json={"phone": AIGERIM["phone"], "pin": f"{9000 + i}"}).status_code
+        return login(client, AIGERIM, pin=f"{9000 + i}").status_code
 
     with ThreadPoolExecutor(20) as pool:
         codes = list(pool.map(attempt, range(40)))
@@ -258,41 +276,156 @@ def test_parallel_login_attempts_do_not_bypass_limit(client, monkeypatch):
 
 
 def test_login_daily_limit_and_retry_after(client, monkeypatch):
-    bad = {"phone": DANIYAR["phone"], "pin": "9999"}
+    auth(client, DANIYAR)
     real = guard.clock
     shift = [0.0]
     monkeypatch.setattr(guard, "clock", lambda: real() + shift[0])
     for round_ in range(3):
         for _ in range(main.LOGIN_ATTEMPTS):
-            assert client.post("/auth/login", json=bad).status_code == 401
-        r = client.post("/auth/login", json=bad)
+            assert login(client, DANIYAR, pin="9999").status_code == 401
+        r = login(client, DANIYAR, pin="9999")
         wait = r.json()["detail"]["retry_after"]
         assert r.status_code == 429 and r.headers["retry-after"] == str(wait)
         assert (0 < wait <= 301) if round_ < 2 else (wait > 23 * 3600), (round_, wait)
         shift[0] += 301
     # 15 неудач за сутки: короткое окно прошло, но вход всё равно закрыт
-    assert client.post("/auth/login", json=bad).status_code == 429
+    assert login(client, DANIYAR, pin="9999").status_code == 429
 
 
 def test_successful_login_clears_short_window(client):
-    bad = {"phone": DANIYAR["phone"], "pin": "9999"}
+    auth(client, DANIYAR)
     for _ in range(main.LOGIN_ATTEMPTS - 1):
-        assert client.post("/auth/login", json=bad).status_code == 401
+        assert login(client, DANIYAR, pin="9999").status_code == 401
     auth(client, DANIYAR)
     for _ in range(main.LOGIN_ATTEMPTS):
-        assert client.post("/auth/login", json=bad).status_code == 401
+        assert login(client, DANIYAR, pin="9999").status_code == 401
 
 
-def test_login_limit_by_client_address(client, monkeypatch):
-    monkeypatch.setattr(main, "IP_HEADER", "x-real-ip")
-    monkeypatch.setattr(main, "_login_ip", guard.Window(3, 600))
+# --- привязка устройства и SMS ---
+
+def confirm(client, pending, pin, code=None):
+    return client.post("/auth/confirm", json={"challenge": pending["challenge"],
+                                              "code": code or pending["demo_code"], "pin": pin})
+
+
+def test_new_device_needs_sms_and_pin_is_not_checked_before_it(client, monkeypatch):
+    sent = []
+    monkeypatch.setattr(main.sms, "send", lambda phone, text: sent.append(phone))
+    right = login(client, AIGERIM).json()
+    wrong = login(client, AIGERIM, pin="9999", secret=device(AIGERIM, 1)).json()
+    nobody = client.post("/auth/login", json={"phone": "+77000000000", "pin": "1111",
+                                              "device_secret": device(AIGERIM, 2)}).json()
+    # Верный PIN, неверный PIN и несуществующий номер выглядят одинаково: по ответу ничего не понять.
+    for reply in (right, wrong, nobody):
+        assert set(reply) == {"sms_required", "challenge", "ttl", "demo_code"}
+    assert sent == [AIGERIM["phone"], AIGERIM["phone"]]
+
+    r = confirm(client, nobody, "1111")
+    assert r.status_code == 401 and r.json()["detail"]["code"] == "invalid_credentials"
+    r = confirm(client, right, "9999")
+    assert r.status_code == 401 and r.json()["detail"]["code"] == "invalid_credentials"
+    r = confirm(client, right, AIGERIM["pin"])
+    assert r.status_code == 200 and "token" in r.json()
+    # тем же кодом второй раз не войти, а с привязанного телефона SMS больше не нужно
+    r = confirm(client, right, AIGERIM["pin"])
+    assert r.status_code == 401 and r.json()["detail"]["code"] == "challenge_expired"
+    assert "token" in login(client, AIGERIM).json()
+
+
+def test_sms_code_attempts_are_limited(client):
+    pending = login(client, AIGERIM).json()
+    wrong = "000000" if pending["demo_code"] != "000000" else "111111"
+    for _ in range(main.SMS_ATTEMPTS - 1):
+        assert confirm(client, pending, AIGERIM["pin"], wrong).json()["detail"]["code"] == "invalid_credentials"
+    assert confirm(client, pending, AIGERIM["pin"], wrong).json()["detail"]["code"] == "challenge_expired"
+    assert confirm(client, pending, AIGERIM["pin"]).json()["detail"]["code"] == "challenge_expired"
+
+
+def test_sms_code_expires(client, monkeypatch):
+    pending = login(client, AIGERIM).json()
+    real = main.time.monotonic
+    monkeypatch.setattr(main.time, "monotonic", lambda: real() + main.SMS_TTL + 1)
+    assert confirm(client, pending, AIGERIM["pin"]).json()["detail"]["code"] == "challenge_expired"
+
+
+def test_sms_are_limited_per_phone_and_address(client, monkeypatch):
     for i in range(3):
-        r = client.post("/auth/login", json={"phone": f"+7700000000{i}", "pin": "1111"},
-                        headers={"X-Real-IP": "203.0.113.7"})
-        assert r.status_code == 401
-    other = {"phone": "+77000000009", "pin": "1111"}
-    assert client.post("/auth/login", json=other, headers={"X-Real-IP": "203.0.113.7"}).status_code == 429
-    assert client.post("/auth/login", json=other, headers={"X-Real-IP": "203.0.113.8"}).status_code == 401
+        assert login(client, AIGERIM, secret=device(AIGERIM, i)).status_code == 200
+    r = login(client, AIGERIM, secret=device(AIGERIM, 9))
+    assert r.status_code == 429 and r.json()["detail"]["code"] == "too_many_sms"
+
+    monkeypatch.setattr(main, "IP_HEADER", "x-real-ip")
+    monkeypatch.setattr(main, "_sms_ip", guard.Window(2, 3600))
+    ip = {"X-Real-IP": "203.0.113.7"}
+    assert login(client, DANIYAR, headers=ip).status_code == 200
+    assert login(client, MERCHANT, headers=ip).status_code == 200
+    assert login(client, DANIYAR, secret=device(DANIYAR, 5), headers=ip).status_code == 429
+    assert login(client, DANIYAR, secret=device(DANIYAR, 5), headers={"X-Real-IP": "203.0.113.8"}).status_code == 200
+
+
+def test_attempts_from_new_device_do_not_lock_owner(client):
+    auth(client, AIGERIM)
+    pending = login(client, AIGERIM, secret=device(AIGERIM, 7)).json()
+    for _ in range(main.SMS_ATTEMPTS):
+        confirm(client, pending, "9999", "123456")
+    assert "token" in login(client, AIGERIM).json()
+
+
+def test_owner_is_told_about_new_device(client):
+    owner = auth(client, MERCHANT)
+    with client.websocket_connect(ws_url(client, owner)) as sock:
+        assert sock.receive_json() == {"type": "ready"}
+        auth(client, MERCHANT, secret=device(MERCHANT, 1))
+        assert sock.receive_json() == {"type": "new_device", "name": "Тест"}
+
+
+# --- устройства ---
+
+def test_devices_list_and_kick(client):
+    mine = auth(client, AIGERIM)
+    thief = auth(client, AIGERIM, secret=device(AIGERIM, 1))
+    items = client.get("/devices", headers=mine).json()["items"]
+    assert len(items) == 2 and sum(d["current"] for d in items) == 1
+    other = next(d for d in items if not d["current"])
+
+    with client.websocket_connect(ws_url(client, thief)) as sock:
+        assert sock.receive_json() == {"type": "ready"}
+        assert client.delete(f"/devices/{other['id']}", headers=mine).status_code == 200
+        with pytest.raises(WebSocketDisconnect):
+            sock.receive_json()
+    assert client.get("/me", headers=thief).status_code == 401
+    assert client.get("/me", headers=mine).status_code == 200
+    # с отвязанного телефона снова нужен код из SMS
+    assert login(client, AIGERIM, secret=device(AIGERIM, 1)).json().get("sms_required") is True
+    assert client.delete(f"/devices/{other['id']}", headers=mine).status_code == 404
+
+
+def test_cannot_kick_someone_elses_device(client):
+    mine, stranger = auth(client, AIGERIM), auth(client, DANIYAR)
+    their = client.get("/devices", headers=stranger).json()["items"][0]["id"]
+    assert client.delete(f"/devices/{their}", headers=mine).status_code == 404
+    assert client.get("/me", headers=stranger).status_code == 200
+
+
+def test_logout_others(client):
+    mine = auth(client, AIGERIM)
+    others = [auth(client, AIGERIM, secret=device(AIGERIM, i)) for i in (1, 2)]
+    assert client.post("/devices/logout-others", headers=mine).json() == {"removed": 2}
+    assert [client.get("/me", headers=h).status_code for h in others] == [401, 401]
+    assert len(client.get("/devices", headers=mine).json()["items"]) == 1
+
+
+# --- разблокировка приложения кодом ---
+
+def test_unlock_checks_pin_and_closes_session_after_too_many_tries(client):
+    me = auth(client, AIGERIM)
+    assert client.post("/auth/unlock", json={"pin": AIGERIM["pin"]}, headers=me).json() == {"ok": True}
+    for _ in range(main.LOGIN_ATTEMPTS):
+        r = client.post("/auth/unlock", json={"pin": "9999"}, headers=me)
+        assert r.status_code == 403 and r.json()["detail"]["code"] == "invalid_pin"
+    assert client.post("/auth/unlock", json={"pin": AIGERIM["pin"]}, headers=me).status_code == 401
+    assert client.get("/me", headers=me).status_code == 401
+    assert "token" in login(client, AIGERIM).json()
 
 
 def test_login_memory_is_bounded():
@@ -432,3 +565,31 @@ def test_daily_limit_window_is_24_hours(client, monkeypatch):
     with db.connect() as c:
         c.execute("UPDATE transfers SET created_at = created_at - ?", (db.DAY + 1,))
     assert client.post("/transfers", json=bt_body(beacon), headers=buyer).status_code == 200
+
+
+def test_bluetooth_id_rotates_and_old_one_works_briefly(client, monkeypatch):
+    seller, buyer = auth(client, MERCHANT), auth(client, AIGERIM)
+    first = client.post("/nearby/beacon", json={}, headers=seller).json()
+    assert client.post("/nearby/beacon", json={}, headers=seller).json()["ble_id"] == first["ble_id"]
+
+    real = nearby.clock
+    monkeypatch.setattr(nearby, "clock", lambda: real() + nearby.BLE_ROTATE + 1)
+    second = client.post("/nearby/beacon", json={}, headers=seller).json()
+    assert second["ble_id"] != first["ble_id"] and second["public_id"] == first["public_id"]
+    people = client.post("/nearby/discover", json={"ble_ids": [first["ble_id"]]}, headers=buyer).json()["people"]
+    assert [p["method"] for p in people] == ["bluetooth"]
+    assert client.post("/transfers", json=bt_body(first), headers=buyer).status_code == 200
+
+    monkeypatch.setattr(nearby, "clock", lambda: real() + nearby.BLE_ROTATE + nearby.BLE_GRACE + 2)
+    client.post("/nearby/beacon", json={}, headers=seller)
+    assert client.post("/nearby/discover", json={"ble_ids": [first["ble_id"]]}, headers=buyer).json()["people"] == []
+    assert client.post("/transfers", json=bt_body(first), headers=buyer).json()["detail"]["code"] == "not_nearby"
+
+
+def test_mocked_location_is_ignored(client):
+    seller, buyer = auth(client, MERCHANT), auth(client, AIGERIM)
+    client.post("/nearby/beacon", json={"location": HERE}, headers=seller)
+    r = client.post("/nearby/discover", json={"location": {**CLOSE, "mocked": True}}, headers=buyer).json()
+    assert r["gps"] == "ignored" and r["people"] == []
+    mocked = client.post("/nearby/beacon", json={"location": {**HERE, "mocked": True}}, headers=seller).json()
+    assert mocked["gps"] == "ignored"

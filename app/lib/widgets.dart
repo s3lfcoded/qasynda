@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:material_ui/material_ui.dart';
 
 import 'state.dart';
@@ -159,6 +161,68 @@ class _RadarPainter extends CustomPainter {
   @override
   bool shouldRepaint(_RadarPainter old) => old.t != t || old.color != color;
 }
+
+/// Баланс, номер, суммы и карта: при включённой настройке показываются точками и открываются
+/// нажатием на 5 секунд. Так их нет ни на скриншоте, ни на записи экрана, если специально не открыть.
+class Sensitive extends StatefulWidget {
+  const Sensitive({super.key, required this.builder});
+  final Widget Function(BuildContext context, bool shown) builder;
+
+  @override
+  State<Sensitive> createState() => _SensitiveState();
+}
+
+class _SensitiveState extends State<Sensitive> {
+  bool _shown = false;
+  Timer? _timer;
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _toggle() {
+    _timer?.cancel();
+    setState(() => _shown = !_shown);
+    if (_shown) _timer = Timer(const Duration(seconds: 5), () => mounted ? setState(() => _shown = false) : null);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final app = AppScope.of(context);
+    if (!app.hideSensitive) return widget.builder(context, true);
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _toggle,
+      child: Semantics(
+        hint: app.s.t('tapToShow'),
+        child: widget.builder(context, _shown),
+      ),
+    );
+  }
+}
+
+/// Заставка поверх приложения, пока оно в фоне: в списке открытых приложений не видно баланса.
+class PrivacyCover extends StatelessWidget {
+  const PrivacyCover({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: Q.bg,
+      alignment: Alignment.center,
+      child: Container(
+        width: 76,
+        height: 76,
+        decoration: BoxDecoration(color: Q.accent, borderRadius: BorderRadius.circular(26)),
+        child: const Icon(Icons.near_me_rounded, size: 38, color: Q.onAccent),
+      ),
+    );
+  }
+}
+
+const masked = '••••';
 
 void showError(BuildContext context, String message) {
   ScaffoldMessenger.of(context)

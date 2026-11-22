@@ -1,4 +1,4 @@
-"""SQLite-хранилище: пользователи, сессии, переводы. Суммы — целые тиыны."""
+"""SQLite-хранилище: пользователи, устройства, сессии, переводы. Суммы — целые тиыны."""
 from __future__ import annotations
 
 import hashlib
@@ -12,6 +12,7 @@ from contextlib import closing
 
 SESSION_TTL = 12 * 3600
 PBKDF2_ROUNDS = 100_000
+DAY = 24 * 3600
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -25,10 +26,20 @@ CREATE TABLE IF NOT EXISTS users(
     business_name TEXT,
     card_last4 TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS devices(
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    secret_hash TEXT NOT NULL,
+    name TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    UNIQUE(user_id, secret_hash)
+);
 CREATE TABLE IF NOT EXISTS sessions(
     token_hash TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id),
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    device_id TEXT REFERENCES devices(id)
 );
 CREATE TABLE IF NOT EXISTS transfers(
     id TEXT PRIMARY KEY,
@@ -76,14 +87,17 @@ def init() -> None:
     with closing(connect()) as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
+        # База, созданная до привязки устройств: у старых сессий устройства нет, они просто истекут.
+        if "device_id" not in {r["name"] for r in c.execute("PRAGMA table_info(sessions)")}:
+            c.execute("ALTER TABLE sessions ADD COLUMN device_id TEXT REFERENCES devices(id)")
 
 
 def _hash_pin(pin: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt), PBKDF2_ROUNDS).hex()
 
 
-def _hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+def _sha(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 def seed_demo() -> None:
@@ -100,37 +114,67 @@ def seed_demo() -> None:
             )
 
 
-def login(phone: str, pin: str) -> str | None:
-    """Возвращает токен сессии или None. В базе хранится только хеш токена."""
+def user_by_phone(phone: str) -> dict | None:
     with closing(connect()) as c:
-        row = c.execute("SELECT id, pin_hash, pin_salt FROM users WHERE phone=?", (phone,)).fetchone()
-        # Считаем хеш и для несуществующего номера, чтобы время ответа не выдавало, есть ли клиент.
-        salt = row["pin_salt"] if row else "00" * 16
-        candidate = _hash_pin(pin, salt)
-        if not row or not hmac.compare_digest(candidate, row["pin_hash"]):
-            return None
-        token = secrets.token_urlsafe(32)
-        now = time.time()
+        row = c.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
+        return dict(row) if row else None
+
+
+def check_pin(user: dict | None, pin: str) -> bool:
+    """Хеш считается и для несуществующего клиента, чтобы время ответа не выдавало, есть ли он."""
+    salt = user["pin_salt"] if user else "00" * 16
+    candidate = _hash_pin(pin, salt)
+    return bool(user) and hmac.compare_digest(candidate, user["pin_hash"])
+
+
+def device_of(user_id: int, secret: str) -> dict | None:
+    with closing(connect()) as c:
+        row = c.execute("SELECT * FROM devices WHERE user_id=? AND secret_hash=?",
+                        (user_id, _sha(secret))).fetchone()
+        return dict(row) if row else None
+
+
+def add_device(user_id: int, secret: str, name: str) -> str:
+    now = time.time()
+    device_id = secrets.token_hex(8)
+    with closing(connect()) as c:
+        c.execute("INSERT OR IGNORE INTO devices(id, user_id, secret_hash, name, created_at, last_seen)"
+                  " VALUES(?,?,?,?,?,?)", (device_id, user_id, _sha(secret), name, now, now))
+        return c.execute("SELECT id FROM devices WHERE user_id=? AND secret_hash=?",
+                         (user_id, _sha(secret))).fetchone()["id"]
+
+
+def create_session(user_id: int, device_id: str) -> str:
+    """Возвращает токен сессии. В базе хранится только хеш токена."""
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with closing(connect()) as c:
         c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
-        c.execute("INSERT INTO sessions(token_hash, user_id, expires_at) VALUES(?,?,?)",
-                  (_hash_token(token), row["id"], now + SESSION_TTL))
-        return token
+        c.execute("INSERT INTO sessions(token_hash, user_id, expires_at, device_id) VALUES(?,?,?,?)",
+                  (_sha(token), user_id, now + SESSION_TTL, device_id))
+        c.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
+    return token
 
 
 def logout(token: str) -> None:
     with closing(connect()) as c:
-        c.execute("DELETE FROM sessions WHERE token_hash=?", (_hash_token(token),))
+        c.execute("DELETE FROM sessions WHERE token_hash=?", (_sha(token),))
 
 
 def user_by_token(token: str) -> dict | None:
+    """Пользователь сессии; в поле session_device — устройство, с которого она открыта."""
     if not token:
         return None
+    now = time.time()
     with closing(connect()) as c:
         row = c.execute(
-            "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id"
+            "SELECT u.*, s.device_id AS session_device FROM sessions s JOIN users u ON u.id = s.user_id"
             " WHERE s.token_hash=? AND s.expires_at > ?",
-            (_hash_token(token), time.time()),
+            (_sha(token), now),
         ).fetchone()
+        if row and row["session_device"]:
+            c.execute("UPDATE devices SET last_seen=? WHERE id=? AND last_seen < ?",
+                      (now, row["session_device"], now - 60))
         return dict(row) if row else None
 
 
@@ -140,7 +184,24 @@ def user_by_id(user_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-DAY = 24 * 3600
+def devices(user_id: int) -> list[dict]:
+    with closing(connect()) as c:
+        rows = c.execute("SELECT id, name, created_at, last_seen FROM devices WHERE user_id=?"
+                         " ORDER BY last_seen DESC", (user_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def remove_devices(user_id: int, device_ids: list[str]) -> list[str]:
+    """Отвязывает устройства и закрывает их сессии. Возвращает, какие устройства действительно удалены."""
+    removed = []
+    with closing(connect()) as c:
+        c.execute("BEGIN IMMEDIATE")
+        for device_id in device_ids:
+            c.execute("DELETE FROM sessions WHERE user_id=? AND device_id=?", (user_id, device_id))
+            if c.execute("DELETE FROM devices WHERE user_id=? AND id=?", (user_id, device_id)).rowcount:
+                removed.append(device_id)
+        c.execute("COMMIT")
+    return removed
 
 
 def make_transfer(sender_id: int, recipient_id: int, amount: int, method: str,
