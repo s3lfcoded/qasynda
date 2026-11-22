@@ -2,26 +2,48 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import os
+import re
+import secrets
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import db, nearby
+from . import db, guard, nearby
 
 # Лимит одного перевода в тиынах. Близость по Bluetooth подделать труднее, чем координаты,
 # поэтому перевод только по GPS ограничен жёстче.
 LIMIT_BLUETOOTH = 500_000_00
 LIMIT_GPS = 50_000_00
+# Минимальный перевод — как у Банка ЦентрКредит по номеру телефона (100 ₸): переводы на 1 тиын
+# с комментарием иначе превращаются в бесплатную рассылку сообщений незнакомым людям.
+MIN_AMOUNT = 100_00
+# Сколько можно отправить за последние 24 часа. Всего — как суточный лимит Kaspi между своими
+# клиентами (2 млн ₸); по GPS — три полных перевода, иначе лимит одного перевода ничего не ограничивает.
+DAILY_LIMIT = 2_000_000_00
+DAILY_LIMIT_GPS = 150_000_00
 
+# Вход: 5 неудачных попыток на номер за 5 минут и 15 за сутки. С 4-значным PIN это больше года
+# перебора на один номер. Попытка записывается до проверки PIN — параллельные запросы лимит не обходят.
 LOGIN_ATTEMPTS = 5
-LOGIN_WINDOW = 300.0
-_login_failures: dict[str, list[float]] = {}
+_login_short = guard.Window(LOGIN_ATTEMPTS, 300)
+_login_long = guard.Window(15, 24 * 3600)
+# Перебор одного PIN по многим номерам ограничивается по адресу клиента — если сервер знает его настоящий адрес.
+_login_ip = guard.Window(50, 600)
+IP_HEADER = os.environ.get("QASYNDA_IP_HEADER", "").strip().lower()
+
+_discover_rate = guard.Window(40, 60)        # приложение спрашивает раз в 2 секунды — 30 в минуту
+_beacon_rate = guard.Window(12, 60)          # приложение продлевает маяк раз в 15 секунд
+_gps_people = guard.Distinct(30, 3600)       # столько разных людей по GPS можно увидеть за час
+_transfer_rate = guard.Window(10, 60)
+_pair_rate = guard.Window(3, 600)            # одному и тому же получателю
 
 HexId = Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")]
 
@@ -52,34 +74,102 @@ class TransferIn(BaseModel):
     location: Location | None = None
     amount: int = Field(gt=0, le=LIMIT_BLUETOOTH)
     idempotency_key: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    # 140 символов — как поле назначения платежа в стандарте ISO 20022, на котором работают платёжные системы.
     note: str | None = Field(default=None, max_length=140)
+
+
+# Комментарий к переводу — канал связи с незнакомым человеком. Ссылки и номера телефонов в нём —
+# основа схемы «я ошибочно перевёл, верните вот сюда», поэтому они запрещены.
+_LINK = re.compile(r"(https?://|www\.|\b(t|wa)\.me\b|\b[a-z0-9-]+\.[a-z]{2,}(/|\b))", re.IGNORECASE)
+_PHONE = re.compile(r"(?:\+?\d[\s\-().]*){10,}")
+
+
+def clean_note(note: str | None) -> str | None:
+    """Убирает невидимые и управляющие символы (в том числе разворот текста), схлопывает пробелы."""
+    if note is None:
+        return None
+    text = "".join(ch if unicodedata.category(ch)[0] not in "CZ" else " " for ch in note)
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if _LINK.search(text) or _PHONE.search(text):
+        raise fail(422, "note_not_allowed")
+    return text
 
 
 class Hub:
     """Открытые WebSocket-соединения по пользователям: мгновенное уведомление о переводе."""
 
+    MAX_PER_USER = 3
+    SEND_TIMEOUT = 2.0
+
     def __init__(self) -> None:
-        self._sockets: dict[int, set[WebSocket]] = {}
+        self._sockets: dict[int, list[WebSocket]] = {}
+        self._tasks: set[asyncio.Task] = set()
 
     def add(self, user_id: int, sock: WebSocket) -> None:
-        self._sockets.setdefault(user_id, set()).add(sock)
+        sockets = self._sockets.setdefault(user_id, [])
+        sockets.append(sock)
+        while len(sockets) > self.MAX_PER_USER:
+            self._spawn(self._close(sockets.pop(0)))
 
     def remove(self, user_id: int, sock: WebSocket) -> None:
         sockets = self._sockets.get(user_id)
-        if sockets:
-            sockets.discard(sock)
+        if sockets and sock in sockets:
+            sockets.remove(sock)
             if not sockets:
                 del self._sockets[user_id]
 
-    async def send(self, user_id: int, event: dict) -> None:
+    def notify(self, user_id: int, event: dict) -> None:
+        """Отправляет в фоне: медленный получатель не задерживает ответ отправителю."""
         for sock in list(self._sockets.get(user_id, ())):
-            try:
-                await sock.send_json(event)
-            except Exception:
-                self.remove(user_id, sock)
+            self._spawn(self._send(user_id, sock, event))
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.get_running_loop().create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _send(self, user_id: int, sock: WebSocket, event: dict) -> None:
+        try:
+            await asyncio.wait_for(sock.send_json(event), self.SEND_TIMEOUT)
+        except Exception:
+            self.remove(user_id, sock)
+            await self._close(sock)
+
+    @staticmethod
+    async def _close(sock: WebSocket) -> None:
+        try:
+            await sock.close(code=4408)
+        except Exception:
+            pass
 
 
 hub = Hub()
+
+# Одноразовые пропуска для WebSocket: выдаются по токену сессии, живут 30 секунд, хранятся хешами.
+TICKET_TTL = 30.0
+_tickets: dict[str, tuple[int, float]] = {}
+
+
+def _ticket_hash(ticket: str) -> str:
+    return hashlib.sha256(ticket.encode()).hexdigest()
+
+
+def issue_ticket(user_id: int) -> str:
+    now = time.monotonic()
+    for h in [h for h, (_, exp) in _tickets.items() if exp <= now]:
+        _tickets.pop(h, None)
+    ticket = secrets.token_urlsafe(24)
+    _tickets[_ticket_hash(ticket)] = (user_id, now + TICKET_TTL)
+    return ticket
+
+
+def redeem_ticket(ticket: str) -> int | None:
+    entry = _tickets.pop(_ticket_hash(ticket), None) if ticket else None
+    if entry is None or entry[1] <= time.monotonic():
+        return None
+    return entry[0]
 
 
 @asynccontextmanager
@@ -103,6 +193,11 @@ def fail(status: int, code: str, **extra) -> HTTPException:
     return HTTPException(status, detail={"code": code, **extra})
 
 
+def slow_down(wait: float) -> HTTPException:
+    return HTTPException(429, detail={"code": "slow_down", "retry_after": int(wait) + 1},
+                         headers={"Retry-After": str(int(wait) + 1)})
+
+
 def _bearer(authorization: str | None) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise fail(401, "unauthorized")
@@ -117,6 +212,23 @@ def current_user(authorization: Annotated[str | None, Header()] = None) -> dict:
 
 
 User = Annotated[dict, Depends(current_user)]
+
+
+def client_ip(request: Request) -> str | None:
+    """Адрес клиента для ограничения входа. За прокси сокет показывает адрес прокси, а X-Forwarded-For
+    клиент может подделать, поэтому заголовок с настоящим адресом задаётся явно (QASYNDA_IP_HEADER)."""
+    if IP_HEADER:
+        value = request.headers.get(IP_HEADER, "").split(",")[0].strip()
+        return value or None
+    return request.client.host if request.client else None
+
+
+def trusted_location(user_id: int, loc: Location | None) -> tuple[Location | None, str]:
+    if loc is None:
+        return None, "off"
+    if not nearby.plausible(user_id, loc.lat, loc.lon, loc.accuracy):
+        return None, "ignored"
+    return loc, "ok"
 
 
 def short_name(full_name: str) -> str:
@@ -147,16 +259,22 @@ def health() -> dict:
 
 
 @app.post("/auth/login")
-def login(body: LoginIn) -> dict:
-    now = time.monotonic()
-    recent = [t for t in _login_failures.get(body.phone, []) if now - t < LOGIN_WINDOW]
-    if len(recent) >= LOGIN_ATTEMPTS:
-        raise fail(429, "too_many_attempts")
+def login(body: LoginIn, request: Request) -> dict:
+    gates: list[tuple[guard.Window, object]] = [(_login_short, body.phone), (_login_long, body.phone)]
+    ip = client_ip(request)
+    if ip:
+        gates.append((_login_ip, ip))
+    wait = guard.take_all(gates)
+    if wait:
+        raise HTTPException(429, detail={"code": "too_many_attempts", "retry_after": int(wait) + 1},
+                            headers={"Retry-After": str(int(wait) + 1)})
     token = db.login(body.phone, body.pin)
     if not token:
-        _login_failures[body.phone] = recent + [now]
         raise fail(401, "invalid_credentials")
-    _login_failures.pop(body.phone, None)
+    _login_short.clear(body.phone)
+    _login_long.refund(body.phone)
+    if ip:
+        _login_ip.refund(ip)
     return {"token": token}
 
 
@@ -175,10 +293,12 @@ def me(user: User) -> dict:
 @app.post("/nearby/beacon")
 def beacon_on(body: BeaconIn, user: User) -> dict:
     """Экран «Принять рядом» открыт. Клиент повторяет запрос каждые ~15 секунд, пока экран открыт."""
-    loc = body.location
+    if wait := guard.take_all([(_beacon_rate, user["id"])]):
+        raise slow_down(wait)
+    loc, gps = trusted_location(user["id"], body.location)
     beacon = nearby.upsert(user["id"], loc.lat if loc else None, loc.lon if loc else None,
                            loc.accuracy if loc else None)
-    return {"public_id": beacon.public_id, "ble_id": beacon.ble_id, "ttl": nearby.BEACON_TTL}
+    return {"public_id": beacon.public_id, "ble_id": beacon.ble_id, "ttl": nearby.BEACON_TTL, "gps": gps}
 
 
 @app.delete("/nearby/beacon")
@@ -190,15 +310,21 @@ def beacon_off(user: User) -> dict:
 @app.post("/nearby/discover")
 def discover(body: DiscoverIn, user: User) -> dict:
     """Кто рядом принимает перевод. Найденные по Bluetooth идут первыми и помечены как подтверждённые."""
+    if wait := guard.take_all([(_discover_rate, user["id"])]):
+        raise slow_down(wait)
     found: dict[int, dict] = {}
     for beacon in nearby.by_ble(body.ble_ids):
-        found[beacon.user_id] = {"public_id": beacon.public_id, "method": "bluetooth", "distance_m": None}
-    if body.location:
-        loc = body.location
+        found[beacon.user_id] = {"public_id": beacon.public_id, "method": "bluetooth", "proximity": "close"}
+    loc, gps = trusted_location(user["id"], body.location)
+    if loc:
         for beacon, distance in nearby.near_by_gps(loc.lat, loc.lon, loc.accuracy):
-            # Расстояние округляем до 10 м: точное положение человека не раскрываем.
-            found.setdefault(beacon.user_id, {"public_id": beacon.public_id, "method": "gps",
-                                              "distance_m": int(round(distance, -1))})
+            if beacon.user_id in found or beacon.user_id == user["id"]:
+                continue
+            if not _gps_people.allow(user["id"], beacon.user_id):
+                continue
+            # Точное расстояние не отдаём: по трём замерам из разных точек оно выдаёт, где стоит человек.
+            found[beacon.user_id] = {"public_id": beacon.public_id, "method": "gps",
+                                     "proximity": "close" if distance <= 25 else "near"}
     found.pop(user["id"], None)
 
     people = []
@@ -207,7 +333,7 @@ def discover(body: DiscoverIn, user: User) -> dict:
         if other:
             limit = LIMIT_BLUETOOTH if entry["method"] == "bluetooth" else LIMIT_GPS
             people.append({**entry, **public_card(other), "limit": limit})
-    return {"people": people}
+    return {"people": people, "gps": gps, "min_amount": MIN_AMOUNT}
 
 
 @app.post("/transfers")
@@ -217,24 +343,31 @@ async def transfer(body: TransferIn, user: User) -> dict:
         raise fail(404, "recipient_not_available")
     if beacon.user_id == user["id"]:
         raise fail(400, "self_transfer")
+    if body.amount < MIN_AMOUNT:
+        raise fail(422, "amount_too_small", min=MIN_AMOUNT)
+    note = clean_note(body.note)
 
     # Способ подтверждения близости определяет сервер, а не клиент.
     # Клиент присылает все маяки, которые сейчас слышит по Bluetooth; какой из них чей, знает только сервер.
+    loc, _ = trusted_location(user["id"], body.location)
     if any(hmac.compare_digest(seen, beacon.ble_id) for seen in body.ble_ids):
         method, limit = "bluetooth", LIMIT_BLUETOOTH
-    elif body.location and nearby.gps_distance(
-            beacon, body.location.lat, body.location.lon, body.location.accuracy) is not None:
+    elif loc and nearby.gps_distance(beacon, loc.lat, loc.lon, loc.accuracy) is not None:
         method, limit = "gps", LIMIT_GPS
     else:
         raise fail(403, "not_nearby")
     if body.amount > limit:
         raise fail(403, "limit_exceeded", limit=limit, method=method)
 
+    if wait := guard.take_all([(_transfer_rate, user["id"]), (_pair_rate, (user["id"], beacon.user_id))]):
+        raise slow_down(wait)
+
+    daily = {None: DAILY_LIMIT, "gps": DAILY_LIMIT_GPS} if method == "gps" else {None: DAILY_LIMIT}
     try:
         result, created = db.make_transfer(user["id"], beacon.user_id, body.amount, method,
-                                           body.note, body.idempotency_key)
+                                           note, body.idempotency_key, daily)
     except db.TransferError as err:
-        raise fail(409, err.code) from None
+        raise fail(err.status, err.code, **err.extra) from None
 
     recipient = db.user_by_id(beacon.user_id)
     sender = db.user_by_id(user["id"])
@@ -244,7 +377,7 @@ async def transfer(body: TransferIn, user: User) -> dict:
         "recipient": public_card(recipient), "balance": sender["balance"],
     }
     if created:
-        await hub.send(beacon.user_id, {
+        hub.notify(beacon.user_id, {
             "type": "transfer_received", "id": result["id"], "amount": result["amount"],
             "method": result["method"], "note": result["note"],
             "sender": short_name(sender["full_name"]), "balance": recipient["balance"],
@@ -270,21 +403,22 @@ def transfers(user: User, limit: Annotated[int, Query(ge=1, le=100)] = 30) -> di
     return {"items": items}
 
 
+@app.post("/ws/ticket")
+def ws_ticket(user: User) -> dict:
+    return {"ticket": issue_ticket(user["id"]), "ttl": TICKET_TTL}
+
+
 @app.websocket("/ws")
-async def ws(sock: WebSocket) -> None:
-    """Токен приходит первым сообщением, а не в адресе: адреса попадают в журналы."""
-    await sock.accept()
-    try:
-        hello = await asyncio.wait_for(sock.receive_json(), timeout=5)
-        token = hello.get("token", "") if isinstance(hello, dict) else ""
-        user = db.user_by_token(token if isinstance(token, str) else "")
-    except Exception:
-        user = None
-    if not user:
+async def ws(sock: WebSocket, ticket: str = "") -> None:
+    """Пропуск проверяется до того, как соединение принято: без него сервер сразу отвечает отказом
+    и не держит открытым ни одного чужого соединения. Пропуск одноразовый и живёт 30 секунд,
+    поэтому его появление в журналах адресов ничего не даёт."""
+    user_id = redeem_ticket(ticket)
+    if user_id is None:
         await sock.close(code=4401)
         return
-
-    hub.add(user["id"], sock)
+    await sock.accept()
+    hub.add(user_id, sock)
     await sock.send_json({"type": "ready"})
     try:
         while True:
@@ -292,4 +426,4 @@ async def ws(sock: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        hub.remove(user["id"], sock)
+        hub.remove(user_id, sock)

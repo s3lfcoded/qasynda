@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS transfers(
     idempotency_key TEXT NOT NULL,
     UNIQUE(sender_id, idempotency_key)
 );
+CREATE INDEX IF NOT EXISTS transfers_sender_time ON transfers(sender_id, created_at);
 """
 
 # Учебные пользователи. Только для демо: включается переменной QASYNDA_SEED_DEMO=1.
@@ -55,9 +56,9 @@ DEMO_USERS = [
 
 
 class TransferError(Exception):
-    def __init__(self, code: str):
+    def __init__(self, code: str, status: int = 409, **extra):
         super().__init__(code)
-        self.code = code
+        self.code, self.status, self.extra = code, status, extra
 
 
 def _path() -> str:
@@ -139,11 +140,18 @@ def user_by_id(user_id: int) -> dict | None:
         return dict(row) if row else None
 
 
+DAY = 24 * 3600
+
+
 def make_transfer(sender_id: int, recipient_id: int, amount: int, method: str,
-                  note: str | None, idempotency_key: str) -> tuple[dict, bool]:
+                  note: str | None, idempotency_key: str,
+                  daily_limits: dict[str | None, int] | None = None) -> tuple[dict, bool]:
     """Атомарный перевод. Возвращает (перевод, создан_ли_сейчас).
 
     Повтор с тем же ключом возвращает исходный перевод и не списывает деньги второй раз.
+    daily_limits — сколько отправитель может перевести за последние 24 часа:
+    ключ None — всего, ключ-способ ("gps") — только этим способом.
+    Суммы считаются внутри той же транзакции, поэтому параллельные переводы лимит не обойдут.
     """
     with closing(connect()) as c:
         c.execute("BEGIN IMMEDIATE")
@@ -157,6 +165,17 @@ def make_transfer(sender_id: int, recipient_id: int, amount: int, method: str,
                     raise TransferError("idempotency_conflict")
                 c.execute("ROLLBACK")
                 return dict(existing), False
+
+            since = time.time() - DAY
+            for scope, limit in (daily_limits or {}).items():
+                spent = c.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM transfers WHERE sender_id=? AND created_at>?"
+                    + ("" if scope is None else " AND method=?"),
+                    (sender_id, since) if scope is None else (sender_id, since, scope),
+                ).fetchone()[0]
+                if spent + amount > limit:
+                    raise TransferError("daily_limit_exceeded", 403, limit=limit, left=max(0, limit - spent),
+                                        method=scope)
 
             debited = c.execute(
                 "UPDATE users SET balance = balance - ? WHERE id=? AND balance >= ?",

@@ -18,12 +18,14 @@ const _ru = <String, String>{
   'searching': 'Ищем получателей рядом…',
   'searchHint': 'Попросите получателя открыть «Принять рядом»',
   'btNear': 'Bluetooth · рядом',
-  'gpsNear': 'GPS · около {m} м',
-  'gpsClose': 'GPS · меньше 10 м',
+  'gpsNear': 'GPS · до 75 м',
+  'gpsClose': 'GPS · совсем рядом',
+  'gpsIgnored': 'Геолокация выглядит неточной — ищем только по Bluetooth',
   'merchant': 'ИП в банке',
   'amount': 'Сумма, ₸',
   'note': 'Комментарий',
-  'limit': 'До {sum} за перевод',
+  'limit': 'От {min} до {sum} за перевод',
+  'underMin': 'Минимальная сумма — {sum}',
   'overLimit': 'Больше лимита {sum}',
   'pay': 'Перевести {sum}',
   'payEmpty': 'Введите сумму',
@@ -39,7 +41,13 @@ const _ru = <String, String>{
   'gpsOff': 'Геолокация недоступна',
   'needNearby': 'Включите Bluetooth или геолокацию и разрешите доступ',
   'err.invalid_credentials': 'Неверный номер или PIN-код',
-  'err.too_many_attempts': 'Слишком много попыток. Подождите 5 минут',
+  'err.too_many_attempts': 'Слишком много попыток. Попробуйте через {wait}',
+  'err.slow_down': 'Слишком часто. Подождите немного',
+  'err.daily_limit_exceeded': 'Превышен суточный лимит. Сегодня доступно ещё {sum}',
+  'err.amount_too_small': 'Минимальная сумма — {sum}',
+  'err.note_not_allowed': 'В комментарии нельзя писать ссылки и номера телефонов',
+  'unit.min': 'мин',
+  'unit.h': 'ч',
   'err.insufficient_funds': 'Недостаточно средств',
   'err.limit_exceeded': 'Сумма больше лимита',
   'err.not_nearby': 'Получатель уже не рядом',
@@ -69,12 +77,14 @@ const _kk = <String, String>{
   'searching': 'Жаныңыздағы алушыларды іздеп жатырмыз…',
   'searchHint': 'Алушыдан «Жанынан қабылдау» экранын ашуды сұраңыз',
   'btNear': 'Bluetooth · жаныңызда',
-  'gpsNear': 'GPS · шамамен {m} м',
-  'gpsClose': 'GPS · 10 м-ден жақын',
+  'gpsNear': 'GPS · 75 м-ге дейін',
+  'gpsClose': 'GPS · өте жақын',
+  'gpsIgnored': 'Геолокация күмәнді — тек Bluetooth арқылы іздейміз',
   'merchant': 'Банктегі ЖК',
   'amount': 'Сома, ₸',
   'note': 'Түсініктеме',
-  'limit': 'Бір аударымға {sum} дейін',
+  'limit': 'Бір аударымға {min} бастап {sum} дейін',
+  'underMin': 'Ең аз сома — {sum}',
   'overLimit': '{sum} лимитінен асады',
   'pay': '{sum} аудару',
   'payEmpty': 'Соманы енгізіңіз',
@@ -90,7 +100,13 @@ const _kk = <String, String>{
   'gpsOff': 'Геолокация қолжетімсіз',
   'needNearby': 'Bluetooth немесе геолокацияны қосып, рұқсат беріңіз',
   'err.invalid_credentials': 'Нөмір немесе PIN-код қате',
-  'err.too_many_attempts': 'Әрекет тым көп. 5 минут күтіңіз',
+  'err.too_many_attempts': 'Әрекет тым көп. {wait} кейін қайталаңыз',
+  'err.slow_down': 'Тым жиі. Сәл күтіңіз',
+  'err.daily_limit_exceeded': 'Тәуліктік лимит асты. Бүгін тағы {sum} қолжетімді',
+  'err.amount_too_small': 'Ең аз сома — {sum}',
+  'err.note_not_allowed': 'Түсініктемеге сілтеме мен телефон нөмірін жазуға болмайды',
+  'unit.min': 'мин',
+  'unit.h': 'сағ',
   'err.insufficient_funds': 'Қаражат жеткіліксіз',
   'err.limit_exceeded': 'Сома лимиттен асады',
   'err.not_nearby': 'Алушы енді жаныңызда емес',
@@ -111,9 +127,18 @@ class S {
     return text;
   }
 
-  String error(String code) {
+  /// Текст ошибки сервера. detail — поля из ответа: retry_after, left, min.
+  String error(String code, [Map<String, dynamic> detail = const {}]) {
     final key = 'err.$code';
-    return _ru.containsKey(key) ? t(key) : t('err.unknown');
+    if (!_ru.containsKey(key)) return t('err.unknown');
+    final args = <String, String>{};
+    final wait = detail['retry_after'];
+    if (wait is int) {
+      args['wait'] = wait < 3600 ? '${(wait / 60).ceil()} ${t('unit.min')}' : '${(wait / 3600).ceil()} ${t('unit.h')}';
+    }
+    final sum = detail['left'] ?? detail['min'];
+    if (sum is int) args['sum'] = money(sum);
+    return t(key, args);
   }
 }
 

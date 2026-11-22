@@ -33,7 +33,7 @@ class _LoginScreenState extends State<LoginScreen> {
     try {
       await app.login(_phone.text, _pin.text);
     } on ApiError catch (e) {
-      if (mounted) showError(context, app.s.error(e.code));
+      if (mounted) showError(context, app.s.error(e.code, e.detail));
     } finally {
       if (mounted) setState(() => _busy = false);
     }

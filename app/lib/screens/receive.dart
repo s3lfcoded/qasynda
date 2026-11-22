@@ -66,7 +66,7 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
       final beacon = await _app.api.post('/nearby/beacon', {'location': location});
       if (mounted) {
         setState(() {
-          _gps = location != null;
+          _gps = beacon['gps'] == 'ok';
           _online = true;
         });
       }

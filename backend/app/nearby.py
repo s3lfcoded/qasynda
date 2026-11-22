@@ -19,6 +19,9 @@ from dataclasses import dataclass
 BEACON_TTL = 45.0          # секунд без обновления до исчезновения маяка
 GPS_RADIUS_M = 75.0        # дальше этого по GPS «рядом» не считается
 MAX_ACCURACY_M = 100.0     # координаты с худшей точностью для поиска не используются
+MAX_SPEED_MPS = 30.0       # быстрее этого человек не перемещается: иначе координаты подставные
+JUMP_SLACK_M = 150.0       # запас на скачки GPS сверх заявленной точности
+ANCHOR_TTL = 24 * 3600.0
 
 
 @dataclass
@@ -34,6 +37,8 @@ class Beacon:
 
 _lock = threading.Lock()
 _by_user: dict[int, Beacon] = {}
+# Последнее правдоподобное положение каждого пользователя (по id, а не по сессии: новый вход его не сбрасывает).
+_anchors: dict[int, tuple[float, float, float, float]] = {}
 
 
 def clock() -> float:
@@ -43,6 +48,7 @@ def clock() -> float:
 def reset() -> None:
     with _lock:
         _by_user.clear()
+        _anchors.clear()
 
 
 def _purge(now: float) -> None:
@@ -88,6 +94,30 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = (math.sin((p2 - p1) / 2) ** 2
          + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
     return 2 * r * math.asin(math.sqrt(a))
+
+
+def plausible(user_id: int, lat: float, lon: float, accuracy: float) -> bool:
+    """Можно ли верить координатам: человек не мог оказаться здесь быстрее, чем позволяет скорость.
+
+    Координаты присылает телефон, и подставить любые несложно. Без этой проверки можно было бы
+    «встать» в любой точке города и узнать, кто там открыл приём, или выставить свой маяк у чужого магазина.
+    Отвергнутые координаты не сдвигают точку отсчёта.
+    """
+    if accuracy > MAX_ACCURACY_M:
+        return False
+    now = clock()
+    with _lock:
+        if len(_anchors) > 10_000:
+            for uid in [uid for uid, a in _anchors.items() if now - a[3] > ANCHOR_TTL]:
+                del _anchors[uid]
+        prev = _anchors.get(user_id)
+        if prev is not None:
+            p_lat, p_lon, p_acc, p_at = prev
+            allowed = MAX_SPEED_MPS * (now - p_at) + p_acc + accuracy + JUMP_SLACK_M
+            if _haversine_m(p_lat, p_lon, lat, lon) > allowed:
+                return False
+        _anchors[user_id] = (lat, lon, accuracy, now)
+        return True
 
 
 def gps_distance(beacon: Beacon, lat: float, lon: float, accuracy: float) -> float | None:

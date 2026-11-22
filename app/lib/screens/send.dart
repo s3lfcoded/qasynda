@@ -29,6 +29,8 @@ class _SendScreenState extends State<SendScreen> {
   Map<String, dynamic>? _location;
   List<Map<String, dynamic>> _people = [];
   String? _error;
+  bool _gpsIgnored = false;
+  int _minAmount = 100 * 100;
 
   @override
   void didChangeDependencies() {
@@ -64,6 +66,8 @@ class _SendScreenState extends State<SendScreen> {
       if (mounted) {
         setState(() {
           _people = (result['people'] as List).cast<Map<String, dynamic>>();
+          _gpsIgnored = result['gps'] == 'ignored';
+          if (result['min_amount'] is int) _minAmount = result['min_amount'] as int;
           _error = null;
         });
       }
@@ -83,7 +87,12 @@ class _SendScreenState extends State<SendScreen> {
 
   void _choose(Map<String, dynamic> person) {
     Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => AmountScreen(person: person, bleIds: () => _scanner.bleIds, location: () => _location),
+      builder: (_) => AmountScreen(
+        person: person,
+        minAmount: _minAmount,
+        bleIds: () => _scanner.bleIds,
+        location: () => _location,
+      ),
     ));
   }
 
@@ -105,7 +114,7 @@ class _SendScreenState extends State<SendScreen> {
                         textAlign: TextAlign.center,
                         style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
                     const SizedBox(height: 8),
-                    Text(nothingWorks ? s.t('needNearby') : s.t('searchHint'),
+                    Text(nothingWorks ? s.t('needNearby') : s.t(_gpsIgnored ? 'gpsIgnored' : 'searchHint'),
                         textAlign: TextAlign.center,
                         style: TextStyle(fontSize: 15, height: 1.35, color: nothingWorks ? Q.danger : Q.muted)),
                   ]),
@@ -156,10 +165,8 @@ class _PersonCard extends StatelessWidget {
                   ? Pill(icon: Icons.bluetooth_rounded, label: s.t('btNear'), color: Q.blue)
                   : Pill(
                       icon: Icons.location_on_rounded,
-                      // сервер округляет расстояние до 10 м, поэтому «0 м» означает «ближе десяти»
-                      label: (person['distance_m'] as int? ?? 0) < 10
-                          ? s.t('gpsClose')
-                          : s.t('gpsNear', {'m': '${person['distance_m']}'}),
+                      // точное расстояние сервер не сообщает: по нему можно вычислить, где стоит человек
+                      label: s.t(person['proximity'] == 'close' ? 'gpsClose' : 'gpsNear'),
                       color: Q.muted),
             ]),
           ]),
@@ -171,8 +178,15 @@ class _PersonCard extends StatelessWidget {
 }
 
 class AmountScreen extends StatefulWidget {
-  const AmountScreen({super.key, required this.person, required this.bleIds, required this.location});
+  const AmountScreen({
+    super.key,
+    required this.person,
+    required this.minAmount,
+    required this.bleIds,
+    required this.location,
+  });
   final Map<String, dynamic> person;
+  final int minAmount;
   final List<String> Function() bleIds;
   final Map<String, dynamic>? Function() location;
 
@@ -213,7 +227,7 @@ class _AmountScreenState extends State<AmountScreen> {
       if (!mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute<void>(builder: (_) => ReceiptScreen(receipt: receipt)));
     } on ApiError catch (e) {
-      if (mounted) showError(context, app.s.error(e.code));
+      if (mounted) showError(context, app.s.error(e.code, e.detail));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -227,7 +241,8 @@ class _AmountScreenState extends State<AmountScreen> {
     final merchant = person['is_merchant'] == true;
     final limit = person['limit'] as int;
     final over = _tiyn > limit;
-    final ready = _tiyn > 0 && !over && !_busy;
+    final under = _tiyn > 0 && _tiyn < widget.minAmount;
+    final ready = _tiyn >= widget.minAmount && !over && !_busy;
 
     return Scaffold(
       appBar: AppBar(),
@@ -262,8 +277,12 @@ class _AmountScreenState extends State<AmountScreen> {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(6, 8, 6, 14),
                   child: Text(
-                    over ? s.t('overLimit', {'sum': money(limit)}) : s.t('limit', {'sum': money(limit)}),
-                    style: TextStyle(fontSize: 13.5, color: over ? Q.danger : Q.muted),
+                    over
+                        ? s.t('overLimit', {'sum': money(limit)})
+                        : under
+                            ? s.t('underMin', {'sum': money(widget.minAmount)})
+                            : s.t('limit', {'min': money(widget.minAmount), 'sum': money(limit)}),
+                    style: TextStyle(fontSize: 13.5, color: over || under ? Q.danger : Q.muted),
                   ),
                 ),
                 TextField(

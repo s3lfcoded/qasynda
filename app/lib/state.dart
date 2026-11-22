@@ -125,13 +125,25 @@ class AppState extends ChangeNotifier {
     final token = api.token;
     if (token == null) return;
     try {
-      final uri = Uri.parse('${api.baseUrl.replaceFirst('http', 'ws')}/ws');
+      // Сервер проверяет одноразовый пропуск до того, как примет соединение. Токен сессии в адрес не попадает.
+      final ticket = (await api.post('/ws/ticket'))['ticket'] as String;
+      final base = Uri.parse(api.baseUrl);
+      final uri = base.replace(
+        scheme: base.scheme == 'https' ? 'wss' : 'ws',
+        path: '${base.path}/ws',
+        queryParameters: {'ticket': ticket},
+      );
       final socket = WebSocketChannel.connect(uri);
       await socket.ready;
       _socket = socket;
-      // Токен идёт первым сообщением, а не в адресе.
-      socket.sink.add(jsonEncode({'token': token}));
       socket.stream.listen(_onMessage, onDone: _retryLater, onError: (_) => _retryLater(), cancelOnError: true);
+    } on ApiError catch (e) {
+      if (e.status == 401) {
+        await _forget();
+        notifyListeners();
+        return;
+      }
+      _retryLater();
     } catch (_) {
       _retryLater();
     }
