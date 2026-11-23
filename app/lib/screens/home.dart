@@ -61,6 +61,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _open(Widget screen) {
+    if (!mounted) return;
     final app = AppScope.of(context);
     Navigator.of(context)
         .push(MaterialPageRoute<void>(builder: (_) => screen))

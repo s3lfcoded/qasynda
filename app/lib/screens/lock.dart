@@ -79,7 +79,7 @@ class _LockScreenState extends State<LockScreen> {
             const SizedBox(height: 32),
             TextField(
               controller: _pin,
-              autofocus: !(app.biometricAvailable && app.biometricEnabled),
+              autofocus: !app.biometricReady,
               keyboardType: TextInputType.number,
               obscureText: true,
               enableSuggestions: false,
@@ -96,7 +96,7 @@ class _LockScreenState extends State<LockScreen> {
                   ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5, color: Q.onAccent))
                   : Text(s.t('unlock')),
             ),
-            if (app.biometricAvailable && app.biometricEnabled) ...[
+            if (app.biometricReady) ...[
               const SizedBox(height: 12),
               OutlinedButton.icon(
                 onPressed: _busy ? null : _biometrics,

@@ -99,7 +99,7 @@ def test_discover_by_gps_finds_close_and_hides_far(client):
     people = client.post("/nearby/discover", json={"location": CLOSE}, headers=buyer).json()["people"]
     assert len(people) == 1
     person = people[0]
-    assert person["method"] == "gps" and person["proximity"] == "close"
+    assert person["method"] == "gps" and person["proximity"] == "near"
     assert "distance_m" not in person
     assert person["is_merchant"] is True and person["business_name"] == MERCHANT["business_name"]
     assert person["name"] == "Нурлан С."
@@ -636,7 +636,13 @@ def test_biometric_secret_unlocks_only_its_device(client):
     fresh = client.post("/auth/bio-key", headers=mine).json()["bio_secret"]
     client.post("/auth/lock", headers=mine)
     assert client.post("/auth/unlock", json={"bio_secret": secret}, headers=mine).status_code == 403
+    assert client.post("/auth/unlock", json={"bio_secret": fresh}, headers=mine).status_code == 200
+    # отключить биометрию можно только из разблокированной сессии: вор не выключит её владельцу
+    client.post("/auth/lock", headers=mine)
+    assert client.delete("/auth/bio-key", headers=mine).status_code == 403
+    client.post("/auth/unlock", json={"pin": AIGERIM["pin"]}, headers=mine)
     assert client.delete("/auth/bio-key", headers=mine).status_code == 200
+    client.post("/auth/lock", headers=mine)
     assert client.post("/auth/unlock", json={"bio_secret": fresh}, headers=mine).status_code == 403
 
 

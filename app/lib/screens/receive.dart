@@ -30,6 +30,7 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
   bool _checked = false; // Bluetooth и геолокация уже опрошены: до этого предупреждение не показываем
   Map<String, dynamic>? _last;
   String? _bleId;
+  bool _disposed = false;
 
   @override
   void didChangeDependencies() {
@@ -54,22 +55,31 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
 
   /// Сервер периодически выдаёт новую Bluetooth-метку: старую перестаём транслировать.
   Future<void> _advertise(String? bleId) async {
-    if (!mounted || bleId == null || bleId == _bleId) return;
+    // Метка запоминается только после удачного запуска трансляции: иначе неудачный запуск
+    // не повторялся бы до следующей смены метки.
+    if (!mounted || bleId == null || (bleId == _bleId && _bluetooth)) return;
     if (_bleId != null) await _advertiser.stop();
-    _bleId = bleId;
     final ok = await _advertiser.start(bleId);
     if (!mounted) {
       await _advertiser.stop();
       return;
     }
+    _bleId = ok ? bleId : null;
     setState(() => _bluetooth = ok);
   }
 
   /// Продлевает маяк на сервере. Возвращает идентификатор для трансляции по Bluetooth.
   Future<String?> _beat() async {
     final location = await currentLocation();
+    // Пока ждали координаты (до 8 секунд), экран могли закрыть: тогда маяк создавать нельзя.
+    if (_disposed) return null;
     try {
       final beacon = await _app.api.post('/nearby/beacon', {'location': location});
+      if (_disposed) {
+        // Запрос ушёл до закрытия экрана, а дошёл после выключения маяка — выключаем ещё раз.
+        _app.api.delete('/nearby/beacon').catchError((_) => <String, dynamic>{});
+        return null;
+      }
       if (mounted) {
         setState(() {
           _gps = beacon['gps'] == 'ok';
@@ -85,6 +95,7 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
 
   @override
   void dispose() {
+    _disposed = true;
     _timer?.cancel();
     _sub?.cancel();
     _advertiser.stop();

@@ -100,6 +100,11 @@ def init() -> None:
             c.execute("ALTER TABLE sessions ADD COLUMN unlocked_until REAL NOT NULL DEFAULT 0")
         if "bio_hash" not in {r["name"] for r in c.execute("PRAGMA table_info(devices)")}:
             c.execute("ALTER TABLE devices ADD COLUMN bio_hash TEXT")
+        if "card_last4" not in {r["name"] for r in c.execute("PRAGMA table_info(users)")}:
+            c.execute("ALTER TABLE users ADD COLUMN card_last4 TEXT NOT NULL DEFAULT '0000'")
+        # Сессии без устройства остались от версии до привязки телефонов: их нельзя ни увидеть
+        # в списке устройств, ни закрыть оттуда, поэтому они закрываются сразу.
+        c.execute("DELETE FROM sessions WHERE device_id IS NULL")
 
 
 def _hash_pin(pin: str, salt: str) -> str:
@@ -154,17 +159,35 @@ def add_device(user_id: int, secret: str, name: str) -> str:
                          (user_id, _sha(secret))).fetchone()["id"]
 
 
-def create_session(user_id: int, device_id: str) -> str:
-    """Возвращает токен сессии. В базе хранится только хеш токена."""
+def create_session(user_id: int, device_id: str) -> str | None:
+    """Возвращает токен сессии или None, если устройство успели отвязать. В базе хранится только хеш токена."""
     token = secrets.token_urlsafe(32)
     now = time.time()
     with closing(connect()) as c:
         c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
         # Сессия открывается сразу после ввода PIN, поэтому она разблокирована.
-        c.execute("INSERT INTO sessions(token_hash, user_id, expires_at, device_id, unlocked_until)"
-                  " VALUES(?,?,?,?,?)", (_sha(token), user_id, now + SESSION_TTL, device_id, now + UNLOCK_TTL))
+        # Вставка идёт только если устройство ещё привязано к этому пользователю — одной командой.
+        inserted = c.execute(
+            "INSERT INTO sessions(token_hash, user_id, expires_at, device_id, unlocked_until)"
+            " SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM devices WHERE id=? AND user_id=?)",
+            (_sha(token), user_id, now + SESSION_TTL, device_id, now + UNLOCK_TTL, device_id, user_id),
+        ).rowcount
+        if not inserted:
+            return None
         c.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
     return token
+
+
+def session_alive(token_hash: str) -> bool:
+    with closing(connect()) as c:
+        return c.execute("SELECT 1 FROM sessions WHERE token_hash=? AND expires_at > ?",
+                         (token_hash, time.time())).fetchone() is not None
+
+
+def logout_others(user_id: int, keep_token: str) -> None:
+    """Закрывает все сессии пользователя, кроме текущей, в том числе без привязанного устройства."""
+    with closing(connect()) as c:
+        c.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (user_id, _sha(keep_token)))
 
 
 def logout(token: str) -> None:
@@ -179,7 +202,8 @@ def user_by_token(token: str) -> dict | None:
     now = time.time()
     with closing(connect()) as c:
         row = c.execute(
-            "SELECT u.*, s.device_id AS session_device, s.unlocked_until AS session_unlocked_until"
+            "SELECT u.*, s.device_id AS session_device, s.unlocked_until AS session_unlocked_until,"
+            " s.token_hash AS session_hash"
             " FROM sessions s JOIN users u ON u.id = s.user_id"
             " WHERE s.token_hash=? AND s.expires_at > ?",
             (_sha(token), now),
@@ -193,6 +217,14 @@ def user_by_token(token: str) -> dict | None:
 def set_unlocked(token: str, until: float) -> None:
     with closing(connect()) as c:
         c.execute("UPDATE sessions SET unlocked_until=? WHERE token_hash=?", (until, _sha(token)))
+
+
+def extend_unlocked(token: str, until: float) -> None:
+    """Продлевает окно разблокировки, только если оно ещё открыто. Иначе запрос, начатый до блокировки
+    и закончившийся после неё, снова открыл бы сессию."""
+    with closing(connect()) as c:
+        c.execute("UPDATE sessions SET unlocked_until=? WHERE token_hash=? AND unlocked_until > ?",
+                  (until, _sha(token), time.time()))
 
 
 def set_bio(device_id: str, secret: str | None) -> None:
@@ -234,6 +266,13 @@ def remove_devices(user_id: int, device_ids: list[str]) -> list[str]:
                 removed.append(device_id)
         c.execute("COMMIT")
     return removed
+
+
+def find_transfer(sender_id: int, idempotency_key: str) -> dict | None:
+    with closing(connect()) as c:
+        row = c.execute("SELECT * FROM transfers WHERE sender_id=? AND idempotency_key=?",
+                        (sender_id, idempotency_key)).fetchone()
+        return dict(row) if row else None
 
 
 def make_transfer(sender_id: int, recipient_id: int, amount: int, method: str,

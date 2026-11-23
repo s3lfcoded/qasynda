@@ -200,6 +200,9 @@ class _AmountScreenState extends State<AmountScreen> {
   // Один ключ на экран: повторное нажатие или обрыв связи не спишет деньги второй раз.
   final _key = List.generate(16, (_) => Random.secure().nextInt(256).toRadixString(16).padLeft(2, '0')).join();
   bool _busy = false;
+  // Ответ на перевод не дошёл: деньги могли уйти. Сумма и комментарий замораживаются, чтобы повтор
+  // с тем же ключом получил исходный чек, а не ошибку «другая сумма» и второй перевод.
+  bool _uncertain = false;
 
   @override
   void dispose() {
@@ -227,7 +230,10 @@ class _AmountScreenState extends State<AmountScreen> {
       if (!mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute<void>(builder: (_) => ReceiptScreen(receipt: receipt)));
     } on ApiError catch (e) {
-      if (mounted) showError(context, app.s.error(e.code, e.detail));
+      if (!mounted) return;
+      final unknownOutcome = e.status == 0 || e.status >= 500;
+      if (unknownOutcome) setState(() => _uncertain = true);
+      showError(context, unknownOutcome ? app.s.t('retrySame') : app.s.error(e.code, e.detail));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -268,6 +274,7 @@ class _AmountScreenState extends State<AmountScreen> {
                 TextField(
                   controller: _amount,
                   autofocus: true,
+                  readOnly: _uncertain,
                   keyboardType: TextInputType.number,
                   inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(7)],
                   style: const TextStyle(fontSize: 34, fontWeight: FontWeight.w800),
@@ -287,7 +294,10 @@ class _AmountScreenState extends State<AmountScreen> {
                 ),
                 TextField(
                   controller: _note,
-                  maxLength: 140,
+                  readOnly: _uncertain,
+                  // Сервер считает длину по символам Юникода, а не по видимым знакам: эмодзи из нескольких
+                  // символов иначе проходили бы здесь и отклонялись там.
+                  inputFormatters: [_CodePointLimit(140)],
                   textCapitalization: TextCapitalization.sentences,
                   decoration: InputDecoration(labelText: s.t('note'), counterText: ''),
                 ),
@@ -360,5 +370,18 @@ class ReceiptScreen extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+
+/// Ограничивает текст числом символов Юникода (как считает сервер), а не видимых знаков.
+class _CodePointLimit extends TextInputFormatter {
+  _CodePointLimit(this.max);
+  final int max;
+
+  @override
+  TextEditingValue formatEditUpdate(TextEditingValue oldValue, TextEditingValue newValue) {
+    if (newValue.text.runes.length <= max) return newValue;
+    return oldValue;
   }
 }

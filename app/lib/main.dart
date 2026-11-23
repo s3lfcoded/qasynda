@@ -30,6 +30,7 @@ class QasyndaApp extends StatelessWidget {
           title: 'Qasynda',
           // Через этот ключ блокировка закрывает экраны, открытые поверх главного.
           navigatorKey: state.navigatorKey,
+          scaffoldMessengerKey: state.messengerKey,
           debugShowCheckedModeBanner: false,
           theme: buildTheme(),
           locale: Locale(state.lang),

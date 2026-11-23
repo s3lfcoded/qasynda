@@ -96,7 +96,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const Divider(height: 1, color: Q.line),
                   SwitchListTile(
                     value: app.biometricEnabled,
-                    onChanged: app.setBiometric,
+                    onChanged: (value) async {
+                      final ok = await app.setBiometric(value);
+                      if (!ok && context.mounted) showError(context, app.s.t('bioFailed'));
+                    },
                     title: Text(s.t('bio')),
                   ),
                 ],

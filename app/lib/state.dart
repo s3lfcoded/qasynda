@@ -34,6 +34,7 @@ class SmsChallenge {
 class AppState extends ChangeNotifier {
   final api = Api();
   final navigatorKey = GlobalKey<NavigatorState>();
+  final messengerKey = GlobalKey<ScaffoldMessengerState>();
   // «Только на этом устройстве»: токен и ключ телефона не попадают в резервную копию iPhone
   // и не переезжают на другой телефон при восстановлении из неё.
   final _storage = const FlutterSecureStorage(
@@ -44,6 +45,10 @@ class AppState extends ChangeNotifier {
   final _alerts = StreamController<Map<String, dynamic>>.broadcast();
   final _pendingAlerts = <Map<String, dynamic>>[];
   final _hidden = Stopwatch();
+  DateTime? _hiddenAt;
+  int _connection = 0;
+  bool _bioEnrolled = false;
+  Future<void>? _lockRequest;
   late final AppLifecycleListener _life;
 
   String lang = 'ru';
@@ -71,13 +76,20 @@ class AppState extends ChangeNotifier {
     _life = AppLifecycleListener(
       onInactive: () => _setCovered(true),
       onResume: () => _setCovered(false),
-      // Время в фоне считается по монотонным часам: перевод часов на телефоне назад блокировку не отменит.
-      onHide: () => _hidden
-        ..reset()
-        ..start(),
+      // Время в фоне считается и по монотонным часам, и по обычным, и берётся большее: перевод часов
+      // назад не отменит блокировку, а глубокий сон телефона (монотонные часы в нём стоят) — тоже.
+      onHide: () {
+        _hidden
+          ..reset()
+          ..start();
+        _hiddenAt = DateTime.now();
+      },
       onShow: () {
         _hidden.stop();
-        if (loggedIn && _hidden.elapsed > _lockAfter) lockNow();
+        final wall = _hiddenAt == null ? Duration.zero : DateTime.now().difference(_hiddenAt!);
+        _hiddenAt = null;
+        final away = wall > _hidden.elapsed ? wall : _hidden.elapsed;
+        if (loggedIn && away > _lockAfter) lockNow();
       },
     );
   }
@@ -86,6 +98,9 @@ class AppState extends ChangeNotifier {
 
   /// В заблокированном приложении профиля может не быть: сервер отдаёт его только после разблокировки.
   bool get loggedIn => api.token != null && (locked || profile != null);
+
+  /// Кнопка Face ID на экране блокировки показывается, только если биометрия действительно привязана.
+  bool get biometricReady => biometricAvailable && biometricEnabled && _bioEnrolled;
 
   /// Входящие переводы в реальном времени.
   Stream<Map<String, dynamic>> get incoming => _incoming.stream;
@@ -149,16 +164,19 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       biometricAvailable = false;
     }
+    _bioEnrolled = await _read('bio_enrolled') == '1';
     api.token = await _read('token');
     if (api.token != null) {
       // Блокировка ставится сразу, до любых запросов: ни сбой сети, ни ошибка сервера её не снимут.
+      // Экран блокировки показывается сразу, запросы к серверу идут в фоне.
       locked = true;
-      try {
-        await api.post('/auth/lock');
-        _connect();
-      } on ApiError catch (e) {
-        if (e.status == 401) await _forget();
-      }
+      _lockRequest = api.post('/auth/lock').then<void>((_) {}).catchError((Object e) async {
+        if (e is ApiError && e.status == 401) {
+          await _forget();
+          notifyListeners();
+        }
+      });
+      _connect();
     }
     ready = true;
     notifyListeners();
@@ -175,11 +193,13 @@ class AppState extends ChangeNotifier {
   void lockNow() {
     if (api.token == null) return;
     navigatorKey.currentState?.popUntil((route) => route.isFirst);
+    // Всплывающие сообщения живут поверх всех экранов: без этого они переезжали бы на экран блокировки.
+    messengerKey.currentState?.clearSnackBars();
     if (!locked) {
       locked = true;
       notifyListeners();
     }
-    api.post('/auth/lock').catchError((_) => <String, dynamic>{});
+    _lockRequest = api.post('/auth/lock').then<void>((_) {}).catchError((_) {});
   }
 
   Future<void> setLang(String value) async {
@@ -200,15 +220,17 @@ class AppState extends ChangeNotifier {
     await _write('hide', value ? '1' : '0');
   }
 
-  Future<void> setBiometric(bool value) async {
+  /// Включает или выключает вход по биометрии. false — включить не удалось (человек отменил или
+  /// хранилище недоступно): переключатель тогда остаётся выключенным.
+  Future<bool> setBiometric(bool value) async {
     biometricEnabled = value;
     notifyListeners();
     await _write('bio', value ? '1' : '0');
-    if (value) {
-      await _enrollBiometrics();
-    } else {
+    if (!value) {
       await _dropBiometrics();
+      return true;
     }
+    return _enrollBiometrics();
   }
 
   /// Секрет этого телефона. IMEI приложениям недоступен ни на iPhone, ни на новых Android,
@@ -245,9 +267,13 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _signedIn(String token) async {
+    _connection++;
+    await _socket?.sink.close();
+    _socket = null;
     api.token = token;
     await _write('token', token);
     await _write('bio_enrolled', null);
+    _bioEnrolled = false;
     locked = false;
     await refresh();
     _connect();
@@ -263,27 +289,33 @@ class AppState extends ChangeNotifier {
   /// Разблокировка Face ID или отпечатком: секрет достаётся из хранилища под биометрией и проверяется
   /// сервером. false — человек отменил, биометрия изменилась или секрета ещё нет: тогда нужен PIN.
   Future<bool> unlockWithBiometrics() async {
-    if (!biometricAvailable || !biometricEnabled || await _read('bio_enrolled') != '1') return false;
+    if (!biometricReady) return false;
     String? secret;
     try {
       secret = await _bioStorage.read(key: 'bio_secret');
     } on PlatformException {
+      // Отмена или ключ стал недействительным (например, добавили новый палец): после входа по коду
+      // биометрия привяжется заново.
+      await _markBioEnrolled(false);
       return false;
     }
-    if (secret == null) {
-      await _write('bio_enrolled', null);
+    // При сбое хранилища Android может вернуть вместо секрета служебную строку.
+    if (secret == null || !RegExp(r'^[A-Za-z0-9_-]{32,128}$').hasMatch(secret)) {
+      await _markBioEnrolled(false);
       return false;
     }
     try {
       await _unlockWith({'bio_secret': secret});
       return true;
     } on ApiError catch (e) {
-      if (e.code == 'invalid_bio') await _write('bio_enrolled', null);
+      if (e.code == 'invalid_bio') await _markBioEnrolled(false);
       rethrow;
     }
   }
 
   Future<void> _unlockWith(Map<String, dynamic> proof) async {
+    // Блокировка, отправленная только что, не должна дойти до сервера после разблокировки и закрыть её.
+    await _lockRequest;
     try {
       await api.post('/auth/unlock', proof);
     } on ApiError catch (e) {
@@ -293,26 +325,46 @@ class AppState extends ChangeNotifier {
       }
       rethrow;
     }
+    // Профиль загружается до снятия блокировки: без него приложение показало бы экран входа.
+    try {
+      await refresh();
+    } on ApiError {
+      if (profile == null) rethrow;
+    }
     locked = false;
     notifyListeners();
-    await refresh().catchError((_) {});
+    if (_socket == null) _connect();
+  }
+
+  Future<void> _markBioEnrolled(bool value) async {
+    _bioEnrolled = value;
+    await _write('bio_enrolled', value ? '1' : null);
   }
 
   /// Привязывает биометрию к этому телефону: сервер выдаёт секрет, приложение кладёт его
   /// в хранилище под биометрией. Делается из разблокированной сессии, один раз.
-  Future<void> _enrollBiometrics() async {
-    if (!biometricAvailable || !biometricEnabled || locked || await _read('bio_enrolled') == '1') return;
+  /// Если человек отменил окно биометрии или хранилище не сработало, биометрия выключается целиком,
+  /// чтобы не спрашивать снова при каждой разблокировке; включить можно в настройках.
+  Future<bool> _enrollBiometrics() async {
+    if (!biometricAvailable || !biometricEnabled || locked) return false;
+    if (_bioEnrolled) return true;
     try {
       final secret = (await api.post('/auth/bio-key'))['bio_secret'] as String;
       await _bioStorage.write(key: 'bio_secret', value: secret);
-      await _write('bio_enrolled', '1');
+      await _markBioEnrolled(true);
+      notifyListeners();
+      return true;
     } catch (_) {
+      biometricEnabled = false;
+      await _write('bio', '0');
       await _dropBiometrics();
+      notifyListeners();
+      return false;
     }
   }
 
   Future<void> _dropBiometrics() async {
-    await _write('bio_enrolled', null);
+    await _markBioEnrolled(false);
     try {
       await _bioStorage.delete(key: 'bio_secret');
     } catch (_) {}
@@ -337,6 +389,7 @@ class AppState extends ChangeNotifier {
   Future<void> logoutOthers() => api.post('/devices/logout-others');
 
   Future<void> _forget() async {
+    _connection++;
     _reconnect?.cancel();
     await _socket?.sink.close();
     _socket = null;
@@ -344,8 +397,10 @@ class AppState extends ChangeNotifier {
     profile = null;
     history = [];
     locked = false;
+    _pendingAlerts.clear();
+    messengerKey.currentState?.clearSnackBars();
     await _write('token', null);
-    await _write('bio_enrolled', null);
+    await _markBioEnrolled(false);
     try {
       await _bioStorage.delete(key: 'bio_secret');
     } catch (_) {}
@@ -372,12 +427,17 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Каждое подключение получает номер. Если пока оно ждало ответа, человек вышел или вошёл заново,
+  /// устаревшее соединение закрывается: иначе события старого аккаунта пришли бы следующему.
   Future<void> _connect() async {
     _reconnect?.cancel();
     if (api.token == null) return;
+    final attempt = ++_connection;
+    bool stale() => attempt != _connection || api.token == null;
     try {
       // Сервер проверяет одноразовый пропуск до того, как примет соединение. Токен сессии в адрес не попадает.
       final ticket = (await api.post('/ws/ticket'))['ticket'] as String;
+      if (stale()) return;
       final base = Uri.parse(api.baseUrl);
       final uri = base.replace(
         scheme: base.scheme == 'https' ? 'wss' : 'ws',
@@ -386,9 +446,14 @@ class AppState extends ChangeNotifier {
       );
       final socket = WebSocketChannel.connect(uri);
       await socket.ready;
+      if (stale()) {
+        await socket.sink.close();
+        return;
+      }
       _socket = socket;
       socket.stream.listen(_onMessage, onDone: _retryLater, onError: (_) => _retryLater(), cancelOnError: true);
     } on ApiError catch (e) {
+      if (stale()) return;
       if (e.status == 401) {
         await _forget();
         notifyListeners();
@@ -396,7 +461,7 @@ class AppState extends ChangeNotifier {
       }
       _retryLater();
     } catch (_) {
-      _retryLater();
+      if (!stale()) _retryLater();
     }
   }
 
