@@ -7,6 +7,7 @@ import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:no_screenshot/no_screenshot.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'api.dart';
@@ -21,8 +22,14 @@ import 'l10n.dart';
 const defaultServer = String.fromEnvironment('QASYNDA_API', defaultValue: 'http://10.0.2.2:8000');
 const canChangeServer = !kReleaseMode;
 
-/// Сколько приложение может пробыть свёрнутым, прежде чем снова спросит код.
-const _lockAfter = Duration(seconds: 60);
+/// Приложение блокируется сразу, как только уходит в фон (hidden / paused). Системные окна —
+/// Face ID, разрешения, вставка из буфера — дают только inactive и не блокируют.
+/// При возврате блокировка проверяется ещё раз: по обычным и по монотонным часам.
+const _lockAfter = Duration.zero;
+
+/// Сколько ждать, пока бесплатный сервер проснётся, и как часто его спрашивать.
+const _wakeTimeout = Duration(seconds: 75);
+const _wakeEvery = Duration(seconds: 3);
 
 /// Вход с нового телефона: сервер ждёт код из SMS. demoCode приходит только в учебном режиме сервера.
 class SmsChallenge {
@@ -63,6 +70,9 @@ class AppState extends ChangeNotifier {
   /// Первый вход с нового телефона: на главном предложить привязать карту, если карт ещё нет.
   bool offerCards = false;
 
+  /// Только что зарегистрировались: Face ID и привязка карты показываются шагами 3 и 4 регистрации.
+  bool registrationSteps = false;
+
   /// Приложение открыто, но код или Face ID ещё не введены.
   bool locked = false;
 
@@ -75,30 +85,57 @@ class AppState extends ChangeNotifier {
   bool biometricEnabled = true;
   bool biometricAvailable = false;
 
+  /// Скриншоты и запись экрана дают пустой кадр. По умолчанию включено.
+  bool blockScreenshots = true;
+
+  /// Имя (без фамилии) для экрана блокировки: при холодном старте профиля ещё нет,
+  /// сервер отдаёт его только после разблокировки. Лежит в защищённом хранилище, стирается при выходе.
+  String? savedName;
+
+  /// После входа спросить «Входить по Face ID?». Молча биометрия не привязывается.
+  bool offerBiometrics = false;
+
   WebSocketChannel? _socket;
+  late final _LifecycleObserver _observer = _LifecycleObserver(this);
   Timer? _reconnect;
 
   AppState() {
     api.onLocked = lockNow;
     _life = AppLifecycleListener(
       onInactive: () => _setCovered(true),
-      onResume: () => _setCovered(false),
-      // Время в фоне считается и по монотонным часам, и по обычным, и берётся большее: перевод часов
-      // назад не отменит блокировку, а глубокий сон телефона (монотонные часы в нём стоят) — тоже.
-      onHide: () {
-        _hidden
-          ..reset()
-          ..start();
-        _hiddenAt = DateTime.now();
+      onResume: () {
+        _setCovered(false);
+        _returned();
       },
-      onShow: () {
-        _hidden.stop();
-        final wall = _hiddenAt == null ? Duration.zero : DateTime.now().difference(_hiddenAt!);
-        _hiddenAt = null;
-        final away = wall > _hidden.elapsed ? wall : _hidden.elapsed;
-        if (loggedIn && away > _lockAfter) lockNow();
-      },
+      onHide: _backgrounded,
+      onPause: _backgrounded,
+      onShow: _returned,
     );
+    // Запасной путь: на части устройств AppLifecycleListener пропускает переходы.
+    WidgetsBinding.instance.addObserver(_observer);
+  }
+
+  /// Ушли в фон: блокировка сразу. Время в фоне считается и по монотонным часам, и по обычным.
+  void _backgrounded() {
+    if (_hiddenAt == null) {
+      _hidden
+        ..reset()
+        ..start();
+      _hiddenAt = DateTime.now();
+    }
+    if (loggedIn && !locked) lockNow();
+  }
+
+  /// Вернулись: если были в фоне, берётся большее из двух времён — перевод часов назад не отменит
+  /// блокировку, а глубокий сон телефона (монотонные часы в нём стоят) — тоже.
+  void _returned() {
+    final hiddenAt = _hiddenAt;
+    if (hiddenAt == null) return;
+    _hidden.stop();
+    final wall = DateTime.now().difference(hiddenAt);
+    _hiddenAt = null;
+    final away = wall > _hidden.elapsed ? wall : _hidden.elapsed;
+    if (loggedIn && !locked && away >= _lockAfter) lockNow();
   }
 
   S get s => S(lang);
@@ -164,7 +201,10 @@ class AppState extends ChangeNotifier {
   Future<void> boot() async {
     lang = await _read('lang') ?? 'ru';
     hideSensitive = await _read('hide') != '0';
-    biometricEnabled = await _read('bio') != '0';
+    final bio = await _read('bio');
+    blockScreenshots = await _read('shots') != '0';
+    unawaited(_applyScreenshots());
+    savedName = await _read('first_name');
     api.baseUrl = canChangeServer ? await _read('server') ?? defaultServer : defaultServer;
     try {
       biometricAvailable = await _auth.isDeviceSupported() && (await _auth.getAvailableBiometrics()).isNotEmpty;
@@ -172,6 +212,8 @@ class AppState extends ChangeNotifier {
       biometricAvailable = false;
     }
     _bioEnrolled = await _read('bio_enrolled') == '1';
+    // Биометрия включается только по согласию: «1» — человек согласился (или привязал её раньше).
+    biometricEnabled = bio == '1' || (bio == null && _bioEnrolled);
     api.token = await _read('token');
     if (api.token != null) {
       // Блокировка ставится сразу, до любых запросов: ни сбой сети, ни ошибка сервера её не снимут.
@@ -191,8 +233,71 @@ class AppState extends ChangeNotifier {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(_observer);
     _life.dispose();
     super.dispose();
+  }
+
+  Future<void> _applyScreenshots() async {
+    try {
+      blockScreenshots ? await NoScreenshot.instance.screenshotOff() : await NoScreenshot.instance.screenshotOn();
+    } catch (_) {
+      // Платформа без поддержки (тесты, десктоп) — ничего не делаем.
+    }
+  }
+
+  Future<void> setBlockScreenshots(bool value) async {
+    blockScreenshots = value;
+    notifyListeners();
+    await _write('shots', value ? '1' : '0');
+    await _applyScreenshots();
+  }
+
+  /// Ответ на «Входить по Face ID?». Флаг ответа хранится: отказавшегося больше не спрашиваем,
+  /// включить можно в настройках. true — биометрия привязана.
+  Future<bool> answerBiometrics(bool yes) async {
+    offerBiometrics = false;
+    await _write('bio_asked', '1');
+    return setBiometric(yes).then((ok) => yes && ok);
+  }
+
+  /// Подтверждение лицом или пальцем перед показом реквизитов карты. Секрет из хранилища не нужен:
+  /// это проверка, что телефон держит владелец.
+  Future<bool> confirmWithBiometrics() async {
+    try {
+      return await _auth.authenticate(localizedReason: s.t('confirmReason'), biometricOnly: true);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Подтверждение кодом: его проверяет сервер (/auth/unlock), ошибки считаются как при разблокировке.
+  Future<void> confirmWithPin(String pin) async {
+    try {
+      await api.post('/auth/unlock', {'pin': pin});
+    } on ApiError catch (e) {
+      if (e.status == 401) {
+        await _forget();
+        notifyListeners();
+      }
+      rethrow;
+    }
+  }
+
+  /// Бесплатный сервер засыпает и просыпается до минуты. Спрашиваем /health каждые 3 секунды
+  /// до 75 секунд; true — сервер ответил.
+  Future<bool> waitForServer({Duration timeout = _wakeTimeout, Duration every = _wakeEvery}) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      try {
+        await api.get('/health');
+        return true;
+      } on ApiError catch (e) {
+        if (e.status != 0) return true;
+      }
+      await Future<void>.delayed(every);
+    }
+    return false;
   }
 
   /// Блокирует приложение: закрывает все открытые поверх главного экраны (перевод, настройки, приём)
@@ -273,9 +378,18 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
-  /// Код из SMS. Верный код только открывает шаг PIN.
-  Future<void> verifyCode(SmsChallenge challenge, String code) =>
-      api.post('/auth/code', {'challenge': challenge.id, 'code': code});
+  /// Код из SMS. Верный код открывает шаг PIN; true — номер уже зарегистрирован,
+  /// false — новый человек: дальше имя и новый PIN (register).
+  Future<bool> verifyCode(SmsChallenge challenge, String code) async {
+    final result = await api.post('/auth/code', {'challenge': challenge.id, 'code': code});
+    return result['registered'] != false;
+  }
+
+  /// Регистрация после верного кода: имя и PIN. Сервер сразу выдаёт разблокированную сессию.
+  Future<void> register(SmsChallenge challenge, String name, String pin) async {
+    final result = await api.post('/auth/register', {'challenge': challenge.id, 'name': name.trim(), 'pin': pin});
+    await _signedIn(result['token'] as String);
+  }
 
   /// PIN с привязанного телефона.
   Future<void> login(String phone, String pin) async {
@@ -298,9 +412,13 @@ class AppState extends ChangeNotifier {
     await _write('bio_enrolled', null);
     _bioEnrolled = false;
     locked = false;
+    // Биометрия не привязывается молча: на главном появится вопрос «Входить по Face ID?».
+    final asked = await _read('bio_asked') == '1';
+    final optedIn = await _read('bio') == '1';
+    biometricEnabled = false;
+    offerBiometrics = biometricAvailable && !(asked && !optedIn);
     await refresh();
     _connect();
-    await _enrollBiometrics();
   }
 
   /// Разблокировка кодом: его проверяет сервер, после пяти ошибок сессия закрывается.
@@ -421,6 +539,10 @@ class AppState extends ChangeNotifier {
     history = [];
     virtualSecret = null;
     offerCards = false;
+    registrationSteps = false;
+    offerBiometrics = false;
+    savedName = null;
+    await _write('first_name', null);
     locked = false;
     _pendingAlerts.clear();
     messengerKey.currentState?.clearSnackBars();
@@ -434,6 +556,11 @@ class AppState extends ChangeNotifier {
   Future<void> refresh() async {
     try {
       profile = await api.get('/me');
+      final first = '${profile!['name'] ?? ''}'.trim().split(' ').first;
+      if (first.isNotEmpty && first != savedName) {
+        savedName = first;
+        unawaited(_write('first_name', first));
+      }
       final list = await api.get('/transfers');
       history = (list['items'] as List).cast<Map<String, dynamic>>();
       notifyListeners();
@@ -525,4 +652,21 @@ class AppScope extends InheritedNotifier<AppState> {
 
   static AppState of(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<AppScope>()!.notifier!;
+}
+
+class _LifecycleObserver with WidgetsBindingObserver {
+  _LifecycleObserver(this.state);
+  final AppState state;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState value) {
+    switch (value) {
+      case AppLifecycleState.hidden || AppLifecycleState.paused || AppLifecycleState.detached:
+        state._backgrounded();
+      case AppLifecycleState.resumed:
+        state._returned();
+      case AppLifecycleState.inactive:
+        break;
+    }
+  }
 }

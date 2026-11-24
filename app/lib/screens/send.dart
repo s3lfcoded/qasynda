@@ -5,7 +5,6 @@ import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../api.dart';
-import '../cards.dart';
 import '../l10n.dart';
 import '../nearby.dart';
 import '../state.dart';
@@ -137,12 +136,24 @@ class _SendScreenState extends State<SendScreen> {
                     ),
                   ]),
                 ),
-                if (_people.isNotEmpty) ...[
+                // Учебные боты — всегда в конце, отдельной секцией.
+                if (_people.any((p) => p['method'] != 'demo')) ...[
                   SectionLabel(s.t('nearYou')),
                   QGroup(
                     dividerIndent: 76,
                     children: [
-                      for (final person in _people) _PersonRow(person: person, s: s, onTap: () => _choose(person)),
+                      for (final person in _people.where((p) => p['method'] != 'demo'))
+                        _PersonRow(person: person, s: s, onTap: () => _choose(person)),
+                    ],
+                  ),
+                ],
+                if (_people.any((p) => p['method'] == 'demo')) ...[
+                  SectionLabel(s.t('botsSection')),
+                  QGroup(
+                    dividerIndent: 76,
+                    children: [
+                      for (final person in _people.where((p) => p['method'] == 'demo'))
+                        _PersonRow(person: person, s: s, onTap: () => _choose(person)),
                     ],
                   ),
                 ],
@@ -169,6 +180,7 @@ class _SendScreenState extends State<SendScreen> {
 List<Widget> proximityTags(S s, Map<String, dynamic> person, {bool short = false}) {
   final merchant = person['is_merchant'] == true;
   final bluetooth = person['method'] == 'bluetooth';
+  if (person['method'] == 'demo') return [QTag(kind: TagKind.bot, label: s.t('botTag'))];
   return [
     if (merchant) QTag(kind: TagKind.merchant, label: s.t('merchant')),
     if (bluetooth)
@@ -191,6 +203,9 @@ class _PersonRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final merchant = person['is_merchant'] == true;
+    final bot = person['method'] == 'demo';
+    final avatar = bot ? (merchant ? AvatarKind.botShop : AvatarKind.bot) : (merchant ? AvatarKind.shop : AvatarKind.initial);
+    final subtitle = bot ? (merchant ? null : s.t('botReturns')) : (merchant ? '${person['name']}' : null);
     return InkWell(
       onTap: onTap,
       highlightColor: Q.surface2,
@@ -199,15 +214,15 @@ class _PersonRow extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           child: Row(children: [
-            Avatar(name: '${person['name']}', kind: merchant ? AvatarKind.shop : AvatarKind.initial),
+            Avatar(name: '${person['name']}', kind: avatar),
             const SizedBox(width: 12),
             Expanded(
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Text(merchant ? '${person['business_name']}' : '${person['name']}',
                     maxLines: 1, overflow: TextOverflow.ellipsis, style: Q.rowTitle.copyWith(color: Q.ink)),
-                if (merchant) ...[
+                if (subtitle != null) ...[
                   const SizedBox(height: 4),
-                  Text('${person['name']}', style: Q.secondary),
+                  Text(subtitle, style: Q.secondary),
                 ],
                 const SizedBox(height: 8),
                 Wrap(spacing: 8, runSpacing: 8, children: proximityTags(s, person)),
@@ -405,7 +420,12 @@ class _AmountScreenState extends State<AmountScreen> {
               padding: const EdgeInsets.fromLTRB(Q.gutter, 8, Q.gutter, 16),
               children: [
                 Row(children: [
-                  Avatar(name: '${person['name']}', kind: merchant ? AvatarKind.shop : AvatarKind.initial),
+                  Avatar(
+                    name: '${person['name']}',
+                    kind: person['method'] == 'demo'
+                        ? (merchant ? AvatarKind.botShop : AvatarKind.bot)
+                        : (merchant ? AvatarKind.shop : AvatarKind.initial),
+                  ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -535,31 +555,10 @@ class ReceiptScreen extends StatefulWidget {
 }
 
 class _ReceiptScreenState extends State<ReceiptScreen> {
-  /// Основная карта — «Списано с Visa •• 8823». Если карт нет или запрос не удался, строки нет.
-  BankCard? _card;
-  bool _asked = false;
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    if (_asked) return;
-    _asked = true;
-    _loadCard();
-  }
-
-  Future<void> _loadCard() async {
-    try {
-      final list = await CardsApi(AppScope.of(context).api).list();
-      final primary = list.items.where((c) => c.isPrimary).firstOrNull;
-      if (mounted && primary != null) setState(() => _card = primary);
-    } catch (_) {}
-  }
-
   @override
   Widget build(BuildContext context) {
     final s = AppScope.of(context).s;
     final receipt = widget.receipt;
-    final card = _card;
     final recipient = receipt['recipient'] as Map<String, dynamic>;
     final merchant = recipient['is_merchant'] == true;
     final bluetooth = receipt['method'] == 'bluetooth';
@@ -632,11 +631,13 @@ class _ReceiptScreenState extends State<ReceiptScreen> {
                       if (merchant) row(s.t('status'), QTag(kind: TagKind.merchant, label: s.t('merchant'))),
                       row(
                         s.t('foundBy'),
-                        QTag(kind: bluetooth ? TagKind.bluetooth : TagKind.gps, label: bluetooth ? 'Bluetooth' : 'GPS'),
+                        receipt['method'] == 'demo'
+                            ? QTag(kind: TagKind.bot, label: s.t('botTag'))
+                            : QTag(kind: bluetooth ? TagKind.bluetooth : TagKind.gps, label: bluetooth ? 'Bluetooth' : 'GPS'),
                       ),
                       if (note.isNotEmpty) row(s.t('note'), bold(note)),
-                      if (card != null)
-                        row(s.t('paidFrom'), bold('${brandName(card.brand) ?? ''} ••\u00A0${card.last4}'.trim())),
+                      // Переводы идут с баланса Qasynda, карта — только для пополнения.
+                      row(s.t('paidFrom'), bold(s.t('balanceQasynda'))),
                       if (created is num)
                         row(s.t('date'), bold(s.date(DateTime.fromMillisecondsSinceEpoch((created * 1000).round())))),
                     ]),

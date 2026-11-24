@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from app import db, guard, main, nearby
+from app import db, demo, guard, main, nearby
 
 AIGERIM, DANIYAR, MERCHANT = db.DEMO_USERS
 HERE = {"lat": 42.9000, "lon": 71.3667, "accuracy": 10}
@@ -26,6 +26,8 @@ def client(tmp_path, monkeypatch):
     guard.reset()
     main._tickets.clear()
     main._challenges.clear()
+    # Учебные боты «рядом» со всеми и мешали бы проверкам поиска; их проверяет test_demo.py.
+    monkeypatch.setattr(demo, "enabled", lambda: False)
     with TestClient(main.app) as c:
         yield c
 
@@ -374,7 +376,7 @@ def test_new_device_pin_is_not_checked_before_the_code(client):
 def test_new_device_full_flow(client):
     pending = start(client, AIGERIM).json()
     r = code(client, pending)
-    assert r.status_code == 200 and r.json() == {"next": "pin"}
+    assert r.status_code == 200 and r.json() == {"ok": True, "registered": True}
     # повтор того же верного кода (ответ потерялся) ничего не ломает и попыток не тратит
     assert code(client, pending).status_code == 200
     r = confirm(client, pending, "9999")

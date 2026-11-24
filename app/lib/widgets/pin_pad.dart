@@ -17,6 +17,8 @@ class PinPad extends StatefulWidget {
     this.leading,
     this.deleteLabel = 'Удалить',
     this.expand = false,
+    this.errorText,
+    this.onInput,
   });
 
   final Future<bool> Function(String pin) onSubmit;
@@ -26,6 +28,12 @@ class PinPad extends StatefulWidget {
 
   /// Точки сверху, клавиатура прижата вниз (24 до safe area): для экранов входа и блокировки.
   final bool expand;
+
+  /// Ошибка под точками («Слишком простой код»): точки красные, пока не начат новый ввод.
+  final String? errorText;
+
+  /// Нажата цифра — родитель может убрать ошибку.
+  final VoidCallback? onInput;
 
   static const keySize = 72.0;
 
@@ -41,6 +49,7 @@ class _PinPadState extends State<PinPad> {
   void _digit(String digit) {
     if (_busy || _pin.length >= widget.length) return;
     HapticFeedback.selectionClick();
+    widget.onInput?.call();
     setState(() => _pin += digit);
     if (_pin.length == widget.length) _submit();
   }
@@ -95,7 +104,7 @@ class _PinPadState extends State<PinPad> {
         child: Row(mainAxisSize: MainAxisSize.min, children: [
           for (var i = 0; i < widget.length; i++) ...[
             if (i > 0) const SizedBox(width: 16),
-            _Dot(index: i, filled: i < _pin.length, animate: !reduced),
+            _Dot(index: i, filled: i < _pin.length, animate: !reduced, error: widget.errorText != null && _pin.isEmpty),
           ],
         ]),
       ),
@@ -106,12 +115,20 @@ class _PinPadState extends State<PinPad> {
       leading: widget.leading,
       deleteLabel: widget.deleteLabel,
     );
-    final busy = SizedBox(
-      height: 24,
-      child: _busy
-          ? const Center(child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)))
-          : null,
-    );
+    final error = widget.errorText;
+    final busy = error != null
+        ? Padding(
+            padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+            child: Text(error,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 14, height: 20 / 14, fontWeight: FontWeight.w500, color: Q.danger)),
+          )
+        : SizedBox(
+            height: 24,
+            child: _busy
+                ? const Center(child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)))
+                : null,
+          );
 
     return Focus(
       autofocus: true,
@@ -125,10 +142,11 @@ class _PinPadState extends State<PinPad> {
 
 /// Точка PIN 16×16: пустая — surface2, заполненная — accent; заполняется с лёгким увеличением.
 class _Dot extends StatelessWidget {
-  const _Dot({required this.index, required this.filled, required this.animate});
+  const _Dot({required this.index, required this.filled, required this.animate, this.error = false});
   final int index;
   final bool filled;
   final bool animate;
+  final bool error;
 
   @override
   Widget build(BuildContext context) {
@@ -136,7 +154,7 @@ class _Dot extends StatelessWidget {
       key: ValueKey('pin-dot-$index'),
       width: 16,
       height: 16,
-      decoration: BoxDecoration(shape: BoxShape.circle, color: filled ? Q.accent : Q.surface2),
+      decoration: BoxDecoration(shape: BoxShape.circle, color: filled ? Q.accent : (error ? Q.danger : Q.surface2)),
     );
     if (!animate || !filled) return dot;
     return TweenAnimationBuilder<double>(

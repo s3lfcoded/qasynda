@@ -12,7 +12,7 @@ import '../widgets/code_cells.dart';
 import '../widgets/phone_field.dart';
 import '../widgets/pin_pad.dart';
 
-enum _Step { phone, code, pin }
+enum _Step { phone, code, pin, name, newPin, repeatPin }
 
 /// Вход в три шага: номер → код из SMS (только для нового телефона) → PIN.
 /// С нового телефона PIN уходит на сервер только после верного кода.
@@ -28,17 +28,26 @@ class _LoginScreenState extends State<LoginScreen> {
   static const _resendAfter = 60;
 
   final _phone = TextEditingController();
+  final _name = TextEditingController();
+  final _lastName = TextEditingController();
+  String? _newPin;
+  String? _pinError;
+  Timer? _slow;
   final _cells = GlobalKey<CodeCellsState>();
   _Step _step = _Step.phone;
   SmsChallenge? _challenge;
   bool _busy = false;
+  bool _waking = false;
   DateTime? _sentAt;
   Timer? _tick;
 
   @override
   void dispose() {
     _tick?.cancel();
+    _slow?.cancel();
     _phone.dispose();
+    _name.dispose();
+    _lastName.dispose();
     super.dispose();
   }
 
@@ -67,11 +76,29 @@ class _LoginScreenState extends State<LoginScreen> {
     _tick = null;
   }
 
+  /// Первый запрос может упереться в спящий сервер: тогда ждём, пока он проснётся, и повторяем.
+  Future<SmsChallenge?> _startWithWake(AppState app) async {
+    try {
+      return await app.startLogin(_number);
+    } on ApiError catch (e) {
+      if (e.code != 'network') rethrow;
+      if (mounted) setState(() => _waking = true);
+      final up = await app.waitForServer();
+      if (!up) rethrow;
+      return app.startLogin(_number);
+    }
+  }
+
   Future<void> _start() async {
     final app = AppScope.of(context);
     setState(() => _busy = true);
+    // Ответа нет дольше 3 секунд — скорее всего, учебный сервер просыпается.
+    _slow?.cancel();
+    _slow = Timer(const Duration(seconds: 3), () {
+      if (mounted && _busy) setState(() => _waking = true);
+    });
     try {
-      final challenge = await app.startLogin(_number);
+      final challenge = await _startWithWake(app);
       if (!mounted) return;
       setState(() {
         _challenge = challenge;
@@ -83,18 +110,25 @@ class _LoginScreenState extends State<LoginScreen> {
         _stopResendTimer();
       }
     } on ApiError catch (e) {
-      if (mounted) showError(context, app.s.error(e.code, e.detail));
+      if (mounted) showError(context, e.code == 'network' && _waking ? app.s.t('serverNoAnswer') : app.s.error(e.code, e.detail));
     } finally {
-      if (mounted) setState(() => _busy = false);
+      _slow?.cancel();
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _waking = false;
+        });
+      }
     }
   }
 
   Future<bool> _code(String code) async {
     final app = AppScope.of(context);
     try {
-      await app.verifyCode(_challenge!, code);
+      final registered = await app.verifyCode(_challenge!, code);
       _stopResendTimer();
-      if (mounted) setState(() => _step = _Step.pin);
+      // Номер не зарегистрирован: регистрация — имя, затем новый PIN дважды.
+      if (mounted) setState(() => _step = registered ? _Step.pin : _Step.name);
       return true;
     } on ApiError catch (e) {
       if (mounted) _failed(e);
@@ -133,7 +167,100 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() {
       _step = _Step.phone;
       _challenge = null;
+      _newPin = null;
     });
+  }
+
+  /// «Назад» на шагах регистрации возвращает на шаг раньше, а не к номеру.
+  void _stepBack() {
+    switch (_step) {
+      case _Step.repeatPin:
+        setState(() => _step = _Step.newPin);
+      case _Step.newPin:
+        setState(() => _step = _Step.name);
+      default:
+        _back();
+    }
+  }
+
+  static final _nameRule = RegExp(r"^[\p{L}]+(?:[ -][\p{L}]+)*$", unicode: true);
+
+  String get _fullName => '${_name.text.trim()} ${_lastName.text.trim()}'.trim();
+
+  bool get _nameValid {
+    final name = _fullName;
+    return _name.text.trim().isNotEmpty && name.length >= 2 && name.length <= 60 && _nameRule.hasMatch(name);
+  }
+
+  /// Как имя увидят получатели: «Айгерим К.».
+  String get _shortName {
+    final first = _name.text.trim();
+    final last = _lastName.text.trim();
+    if (first.isEmpty) return '…';
+    return last.isEmpty ? first : '$first ${last.characters.first}.';
+  }
+
+  /// Простые коды: 4 одинаковые цифры, последовательности вверх и вниз (1234, 9876), годы 1950–2015,
+  /// чередование (1212) — сервер их тоже не примет.
+  static bool _weak(String pin) {
+    final d = pin.split('').map(int.parse).toList();
+    if (d.toSet().length == 1) return true;
+    final up = [for (var i = 1; i < 4; i++) d[i] - d[i - 1]].every((x) => x == 1);
+    final down = [for (var i = 1; i < 4; i++) d[i] - d[i - 1]].every((x) => x == -1);
+    final year = int.parse(pin);
+    return up || down || (year >= 1950 && year <= 2015) || (d[0] == d[2] && d[1] == d[3]);
+  }
+
+  Future<bool> _setNewPin(String pin) async {
+    final s = AppScope.of(context).s;
+    if (_weak(pin)) {
+      setState(() => _pinError = s.t('weakPin'));
+      return false;
+    }
+    setState(() {
+      _newPin = pin;
+      _pinError = null;
+      _step = _Step.repeatPin;
+    });
+    return true;
+  }
+
+  Future<bool> _register(String pin) async {
+    final app = AppScope.of(context);
+    final s = app.s;
+    if (pin != _newPin) {
+      setState(() {
+        _newPin = null;
+        _pinError = s.t('pinMismatch');
+        _step = _Step.newPin;
+      });
+      return false;
+    }
+    try {
+      // Дальше на главном: «Входить по Face ID?» и «Привяжите карту» — шаги 3 и 4 регистрации.
+      app.offerCards = true;
+      app.registrationSteps = true;
+      await app.register(_challenge!, _fullName, pin);
+      return true;
+    } on ApiError catch (e) {
+      app.offerCards = false;
+      app.registrationSteps = false;
+      if (!mounted) return false;
+      switch (e.code) {
+        case 'weak_pin' || 'invalid_request':
+          setState(() {
+            _pinError = s.t('weakPin');
+            _step = _Step.newPin;
+          });
+          return false;
+        case 'invalid_name':
+          setState(() => _step = _Step.name);
+        case 'challenge_expired' || 'code_required' || 'already_registered':
+          _back();
+      }
+      showError(context, s.error(e.code, e.detail));
+      return false;
+    }
   }
 
   Future<void> _editServer() async {
@@ -162,9 +289,11 @@ class _LoginScreenState extends State<LoginScreen> {
           child: SizedBox(
             height: 56,
             child: Row(children: [
-              const QasyndaMark(size: 32),
-              const SizedBox(width: 8),
-              Text('Qasynda', style: Q.section.copyWith(color: Q.ink, letterSpacing: -0.2)),
+              AnimatedMark(
+                size: 32,
+                once: true,
+                label: Text('Qasynda', style: Q.section.copyWith(color: Q.ink, letterSpacing: -0.2)),
+              ),
               const Spacer(),
               if (canChangeServer)
                 IconButton(
@@ -198,7 +327,22 @@ class _LoginScreenState extends State<LoginScreen> {
         ),
         Padding(
           padding: EdgeInsets.fromLTRB(Q.gutter, 0, Q.gutter, keyboard ? 12 : 8),
-          child: QButton(label: s.t('continue'), onPressed: ready ? _start : null, busy: _busy),
+          child: QButton(
+            label: s.t('continue'),
+            onPressed: ready ? _start : null,
+            busy: _busy,
+            busyLabel: _waking ? s.t('waking') : null,
+          ),
+        ),
+        AnimatedSize(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOutCubic,
+          child: _waking
+              ? Padding(
+                  padding: const EdgeInsets.fromLTRB(Q.gutter + 16, 4, Q.gutter + 16, 16),
+                  child: Text(s.t('wakingHint'), textAlign: TextAlign.center, style: Q.secondary),
+                )
+              : const SizedBox(width: double.infinity),
         ),
       ]),
     );
@@ -281,6 +425,93 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
+  Widget _nameStep(BuildContext context, bool keyboard) {
+    final s = AppScope.of(context).s;
+    const style = TextStyle(fontSize: 18, height: 24 / 18, fontWeight: FontWeight.w500, color: Q.ink);
+    Widget label(String text) => Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Text(text, style: Q.secondary.copyWith(fontWeight: FontWeight.w500)),
+        );
+    void next() {
+      if (_nameValid) setState(() => _step = _Step.newPin);
+    }
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Expanded(
+        child: ListView(
+          keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+          padding: const EdgeInsets.fromLTRB(Q.gutter, 8, Q.gutter, 24),
+          children: [
+            Text(s.t('nameTitle'), style: Q.title.copyWith(color: Q.ink)),
+            const SizedBox(height: 8),
+            Text(s.t('nameHint', {'name': _shortName}), style: Q.body),
+            const SizedBox(height: 24),
+            label(s.t('firstName')),
+            TextField(
+              controller: _name,
+              autofocus: true,
+              textCapitalization: TextCapitalization.words,
+              textInputAction: TextInputAction.next,
+              autofillHints: const [AutofillHints.givenName],
+              maxLength: 40,
+              style: style,
+              decoration: const InputDecoration(counterText: ''),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 16),
+            label(s.t('lastName')),
+            TextField(
+              controller: _lastName,
+              textCapitalization: TextCapitalization.words,
+              autofillHints: const [AutofillHints.familyName],
+              maxLength: 40,
+              style: style,
+              decoration: InputDecoration(
+                counterText: '',
+                hintText: s.t('lastNameHint'),
+                hintStyle: style.copyWith(color: Q.ink3, fontWeight: FontWeight.w400),
+              ),
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) => next(),
+            ),
+          ],
+        ),
+      ),
+      Padding(
+        padding: EdgeInsets.fromLTRB(Q.gutter, 0, Q.gutter, keyboard ? 12 : 8),
+        child: QButton(label: s.t('continue'), onPressed: _nameValid ? next : null),
+      ),
+    ]);
+  }
+
+  Widget _newPinStep(BuildContext context, {required bool repeat}) {
+    final s = AppScope.of(context).s;
+    return Column(children: [
+      const SizedBox(height: 32),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: Q.gutter),
+        child: Column(children: [
+          Text(s.t(repeat ? 'repeatPinTitle' : 'newPinTitle'), textAlign: TextAlign.center, style: Q.titleM.copyWith(color: Q.ink)),
+          const SizedBox(height: 8),
+          Text(s.t(repeat ? 'repeatPinHint' : 'newPinHint'), textAlign: TextAlign.center, style: Q.body),
+        ]),
+      ),
+      const SizedBox(height: 32),
+      Expanded(
+        child: PinPad(
+          key: ValueKey(repeat),
+          onSubmit: repeat ? _register : _setNewPin,
+          deleteLabel: s.t('pinDelete'),
+          expand: true,
+          errorText: repeat ? null : _pinError,
+          onInput: () {
+            if (_pinError != null) setState(() => _pinError = null);
+          },
+        ),
+      ),
+    ]);
+  }
+
   Widget _pinStep(BuildContext context) {
     final s = AppScope.of(context).s;
     return Column(children: [
@@ -308,14 +539,27 @@ class _LoginScreenState extends State<LoginScreen> {
       _Step.phone => _phoneStep(context, keyboard),
       _Step.code => SafeArea(top: false, child: _codeStep(context, challenge!)),
       _Step.pin => SafeArea(top: false, child: _pinStep(context)),
+      _Step.name => SafeArea(top: false, child: _nameStep(context, keyboard)),
+      _Step.newPin => SafeArea(top: false, child: _newPinStep(context, repeat: false)),
+      _Step.repeatPin => SafeArea(top: false, child: _newPinStep(context, repeat: true)),
     };
     return PopScope(
       canPop: _step == _Step.phone,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _back();
+        if (!didPop) _stepBack();
       },
       child: Scaffold(
-        appBar: _step == _Step.phone ? null : QAppBar(onBack: _back),
+        appBar: _step == _Step.phone
+            ? null
+            : QAppBar(
+                onBack: _stepBack,
+                // Регистрация: имя, PIN, Face ID, карта.
+                middle: switch (_step) {
+                  _Step.name => const StepsBar(count: 4, done: 1),
+                  _Step.newPin || _Step.repeatPin => const StepsBar(count: 4, done: 2),
+                  _ => null,
+                },
+              ),
         body: _StepSwitcher(step: _step.index, child: KeyedSubtree(key: ValueKey(_step), child: body)),
       ),
     );

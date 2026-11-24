@@ -41,7 +41,7 @@ class _SupportScreenState extends State<SupportScreen> {
   @override
   Widget build(BuildContext context) {
     final s = AppScope.of(context).s;
-    final sums = {'bt': money(limitBluetooth), 'gps': money(limitGps), 'min': money(100 * 100)};
+    final sums = {'bt': money(limitBluetooth), 'gps': money(limitGps), 'min': money(100 * 100), 'sum': money(5000 * 100)};
     return Scaffold(
       appBar: QAppBar(title: s.t('support')),
       body: SafeArea(
@@ -54,7 +54,7 @@ class _SupportScreenState extends State<SupportScreen> {
               child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
                 SectionLabel(s.t('faq'), top: 8),
                 QGroup(children: [
-                  for (var i = 0; i < 7; i++)
+                  for (var i = 0; i < 8; i++)
                     _FaqItem(
                       question: s.t('faq${i + 1}q'),
                       answer: s.t('faq${i + 1}a', sums),

@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS users(
     balance INTEGER NOT NULL CHECK(balance >= 0),
     is_merchant INTEGER NOT NULL DEFAULT 0,
     business_name TEXT,
-    card_last4 TEXT NOT NULL
+    card_last4 TEXT NOT NULL,
+    is_bot INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS devices(
     id TEXT PRIMARY KEY,
@@ -73,6 +74,17 @@ CREATE TABLE IF NOT EXISTS cards(
     UNIQUE(user_id, brand, last4, expiry)
 );
 CREATE INDEX IF NOT EXISTS cards_user ON cards(user_id, created_at);
+-- Учебные пополнения с привязанной карты. Бренд и последние цифры копируются: карту могут удалить, а история останется.
+CREATE TABLE IF NOT EXISTS topups(
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    card_id TEXT NOT NULL,
+    brand TEXT NOT NULL,
+    last4 TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK(amount > 0),
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS topups_user_time ON topups(user_id, created_at);
 """
 
 # Учебные пользователи. Только для демо: включается переменной QASYNDA_SEED_DEMO=1.
@@ -84,6 +96,19 @@ DEMO_USERS = [
     {"phone": "+77010000003", "pin": "3333", "full_name": "Нурлан Сейтов",
      "balance": 80_000_00, "is_merchant": 1, "business_name": "ИП Сейтов · Жеміс-жидек", "card_last4": "1906"},
 ]
+
+
+# Учебные боты: появляются только при QASYNDA_SEED_DEMO=1. Номер не похож на телефон (+7…), поэтому
+# войти за бота нельзя ни одним запросом /auth. Баланс огромный: боты учебные и не должны заканчиваться.
+BOT_BALANCE = 10**15
+DEMO_BOTS = [
+    {"phone": "bot:coffee", "full_name": "Кофейня Qasynda", "is_merchant": 1,
+     "business_name": "Кофейня Qasynda · бот", "card_last4": "0001"},
+    {"phone": "bot:aliya", "full_name": "Алия Бот", "is_merchant": 0, "business_name": None, "card_last4": "0002"},
+]
+
+# Дневной лимит «по GPS» считает и переводы учебным ботам: у них тоже нет доказательства близости.
+SCOPE_METHODS = {"gps": ("gps", "demo")}
 
 
 class TransferError(Exception):
@@ -115,8 +140,11 @@ def init() -> None:
             c.execute("ALTER TABLE sessions ADD COLUMN unlocked_until REAL NOT NULL DEFAULT 0")
         if "bio_hash" not in {r["name"] for r in c.execute("PRAGMA table_info(devices)")}:
             c.execute("ALTER TABLE devices ADD COLUMN bio_hash TEXT")
-        if "card_last4" not in {r["name"] for r in c.execute("PRAGMA table_info(users)")}:
+        user_columns = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
+        if "card_last4" not in user_columns:
             c.execute("ALTER TABLE users ADD COLUMN card_last4 TEXT NOT NULL DEFAULT '0000'")
+        if "is_bot" not in user_columns:
+            c.execute("ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
         # Сессии без устройства остались от версии до привязки телефонов: их нельзя ни увидеть
         # в списке устройств, ни закрыть оттуда, поэтому они закрываются сразу.
         c.execute("DELETE FROM sessions WHERE device_id IS NULL")
@@ -142,6 +170,44 @@ def seed_demo() -> None:
                 (u["phone"], _hash_pin(u["pin"], salt), salt, u["full_name"],
                  u["balance"], u["is_merchant"], u["business_name"], u["card_last4"]),
             )
+
+
+def seed_bots() -> None:
+    """Учебные боты. Добавляются и в уже заполненную базу, повторный вызов ничего не меняет."""
+    with closing(connect()) as c:
+        for bot in DEMO_BOTS:
+            c.execute(
+                "INSERT OR IGNORE INTO users(phone, pin_hash, pin_salt, full_name, balance, is_merchant, business_name,"
+                " card_last4, is_bot) VALUES(?,?,?,?,?,?,?,?,1)",
+                (bot["phone"], secrets.token_hex(32), secrets.token_hex(16), bot["full_name"], BOT_BALANCE,
+                 bot["is_merchant"], bot["business_name"], bot["card_last4"]),
+            )
+
+
+def bots() -> list[dict]:
+    with closing(connect()) as c:
+        return [dict(r) for r in c.execute("SELECT * FROM users WHERE is_bot=1 ORDER BY id")]
+
+
+def create_user(phone: str, pin: str, full_name: str, last4_for) -> int | None:
+    """Новый пользователь с нулевым балансом. None — номер уже занят (параллельная регистрация).
+    last4_for(id) даёт последние цифры учебной карты: они зависят от id, который известен только после вставки."""
+    salt = secrets.token_hex(16)
+    with closing(connect()) as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            cur = c.execute(
+                "INSERT INTO users(phone, pin_hash, pin_salt, full_name, balance, is_merchant, business_name, card_last4)"
+                " VALUES(?,?,?,?,0,0,NULL,'0000')",
+                (phone, _hash_pin(pin, salt), salt, full_name),
+            )
+        except sqlite3.IntegrityError:
+            c.execute("ROLLBACK")
+            return None
+        user_id = cur.lastrowid
+        c.execute("UPDATE users SET card_last4=? WHERE id=?", (last4_for(user_id), user_id))
+        c.execute("COMMIT")
+    return user_id
 
 
 def user_by_phone(phone: str) -> dict | None:
@@ -315,10 +381,11 @@ def make_transfer(sender_id: int, recipient_id: int, amount: int, method: str,
 
             since = time.time() - DAY
             for scope, limit in (daily_limits or {}).items():
+                methods = () if scope is None else SCOPE_METHODS.get(scope, (scope,))
                 spent = c.execute(
                     "SELECT COALESCE(SUM(amount), 0) FROM transfers WHERE sender_id=? AND created_at>?"
-                    + ("" if scope is None else " AND method=?"),
-                    (sender_id, since) if scope is None else (sender_id, since, scope),
+                    + (f" AND method IN ({','.join('?' * len(methods))})" if methods else ""),
+                    (sender_id, since, *methods),
                 ).fetchone()[0]
                 if spent + amount > limit:
                     raise TransferError("daily_limit_exceeded", 403, limit=limit, left=max(0, limit - spent),
@@ -353,16 +420,55 @@ def make_transfer(sender_id: int, recipient_id: int, amount: int, method: str,
 
 
 def history(user_id: int, limit: int) -> list[dict]:
+    """Переводы и пополнения вместе, новые сверху. У пополнения kind = 'topup', бренд и последние цифры карты
+    лежат в card_brand / card_last4."""
     with closing(connect()) as c:
         rows = c.execute(
-            "SELECT t.id, t.amount, t.method, t.note, t.created_at, t.sender_id,"
-            " s.full_name AS sender_name, s.is_merchant AS sender_is_merchant, r.full_name AS recipient_name,"
-            " r.is_merchant AS recipient_is_merchant, r.business_name AS recipient_business"
+            "SELECT * FROM ("
+            " SELECT 'transfer' AS kind, t.id, t.amount, t.method, t.note, t.created_at, t.sender_id,"
+            " s.full_name AS sender_name, s.is_merchant AS sender_is_merchant, s.is_bot AS sender_is_bot,"
+            " r.full_name AS recipient_name, r.is_merchant AS recipient_is_merchant,"
+            " r.business_name AS recipient_business, r.is_bot AS recipient_is_bot,"
+            " NULL AS card_brand, NULL AS card_last4"
             " FROM transfers t JOIN users s ON s.id = t.sender_id JOIN users r ON r.id = t.recipient_id"
-            " WHERE t.sender_id=? OR t.recipient_id=? ORDER BY t.created_at DESC LIMIT ?",
-            (user_id, user_id, limit),
+            " WHERE t.sender_id=? OR t.recipient_id=?"
+            " UNION ALL"
+            " SELECT 'topup', id, amount, 'topup', NULL, created_at, NULL, NULL, 0, 0, NULL, 0, NULL, 0, brand, last4"
+            " FROM topups WHERE user_id=?"
+            ") ORDER BY created_at DESC LIMIT ?",
+            (user_id, user_id, user_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def card_of(user_id: int, card_id: str) -> dict | None:
+    with closing(connect()) as c:
+        row = c.execute(f"SELECT {_CARD_COLUMNS} FROM cards WHERE user_id=? AND id=?", (user_id, card_id)).fetchone()
+        return _card(row) if row else None
+
+
+def topup(user_id: int, card: dict, amount: int, daily_limit: int) -> tuple[dict, int]:
+    """Учебное пополнение: проверка суточного лимита, запись и рост баланса — одна транзакция.
+    Возвращает (пополнение, новый баланс)."""
+    with closing(connect()) as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            spent = c.execute("SELECT COALESCE(SUM(amount), 0) FROM topups WHERE user_id=? AND created_at>?",
+                              (user_id, time.time() - DAY)).fetchone()[0]
+            if spent + amount > daily_limit:
+                raise TransferError("topup_limit_exceeded", 403, limit=daily_limit, left=max(0, daily_limit - spent))
+            item = {"id": uuid.uuid4().hex, "user_id": user_id, "card_id": card["id"], "brand": card["brand"],
+                    "last4": card["last4"], "amount": amount, "created_at": time.time()}
+            c.execute("INSERT INTO topups(id, user_id, card_id, brand, last4, amount, created_at)"
+                      " VALUES(:id, :user_id, :card_id, :brand, :last4, :amount, :created_at)", item)
+            c.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amount, user_id))
+            balance = c.execute("SELECT balance FROM users WHERE id=?", (user_id,)).fetchone()[0]
+            c.execute("COMMIT")
+            return item, balance
+        except BaseException:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
 
 
 _CARD_COLUMNS = "id, brand, last4, expiry, holder, is_primary, created_at"

@@ -93,3 +93,9 @@ def virtual(user_id: int, last4: str, holder: str) -> dict:
     cvv = f"{int.from_bytes(h[7:10], 'big') % 1000:03d}"
     return {"brand": VIRTUAL_BRAND, "number": number, "last4": last4, "expiry": f"{month:02d}/{year:02d}",
             "cvv": cvv, "holder": holder}
+
+
+def virtual_last4(user_id: int) -> str:
+    """Последние 4 цифры учебной карты нового пользователя: из того же ключа, что и остальной номер."""
+    h = hmac.new(_virtual_key(), f"last4:{user_id}".encode(), hashlib.sha256).digest()
+    return f"{int.from_bytes(h[:4], 'big') % 10_000:04d}"

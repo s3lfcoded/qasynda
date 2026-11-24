@@ -41,7 +41,18 @@ class QasyndaApp extends StatelessWidget {
             GlobalCupertinoLocalizations.delegate,
           ],
           home: !state.ready
-              ? const Scaffold(body: Center(child: CircularProgressIndicator()))
+              // Запуск: знак прорисовывается, пока читаются настройки.
+              ? const Scaffold(
+                  body: Center(
+                    child: AnimatedMark(
+                      size: 96,
+                      vertical: true,
+                      gap: 16,
+                      label: Text('Qasynda',
+                          style: TextStyle(fontSize: 28, height: 36 / 28, fontWeight: FontWeight.w700, letterSpacing: -0.4, color: Q.ink)),
+                    ),
+                  ),
+                )
               : !state.loggedIn
                   ? const LoginScreen()
                   : state.locked

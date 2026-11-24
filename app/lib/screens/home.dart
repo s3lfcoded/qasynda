@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -10,7 +11,10 @@ import '../l10n.dart';
 import '../state.dart';
 import '../theme.dart';
 import '../widgets.dart';
+import '../widgets/pin_pad.dart';
 import 'add_card.dart';
+import 'onboarding.dart';
+import 'topup.dart';
 import 'receive.dart';
 import 'send.dart';
 import 'settings.dart';
@@ -39,21 +43,25 @@ class _HomeScreenState extends State<HomeScreen> {
   late final AppLifecycleListener _life;
   bool _offered = false;
 
+  /// Реквизиты карты (оборот и CVV) показываются только после Face ID или кода. Подтверждение
+  /// действует 5 минут и сбрасывается при уходе в фон и когда карта возвращается на лицо.
+  DateTime? _detailsUntil;
+  bool _revealed = false;
+
   @override
   void initState() {
     super.initState();
-    _life = AppLifecycleListener(onInactive: _hideCvv, onHide: _hideCvv);
+    _life = AppLifecycleListener(onInactive: _hideCvv, onHide: _closeDetails);
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     final app = AppScope.of(context);
-    // Первый вход с нового телефона: если карт нет, предлагаем привязать.
-    if (app.offerCards && !_offered) {
+    // После входа: сначала вопрос про Face ID, затем (с нового телефона и без карт) привязка карты.
+    if ((app.offerBiometrics || app.offerCards) && !_offered) {
       _offered = true;
-      app.offerCards = false;
-      WidgetsBinding.instance.addPostFrameCallback((_) => _offerCards());
+      WidgetsBinding.instance.addPostFrameCallback((_) => _afterLogin());
     }
     _sub ??= app.incoming.listen((event) {
       // На экране приёма перевод показывается крупно, здесь — короткое уведомление.
@@ -87,37 +95,142 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_reveal) _hide = Timer(const Duration(seconds: 5), () => mounted ? setState(() => _reveal = false) : null);
   }
 
-  Future<void> _offerCards() async {
+  Future<void> _afterLogin() async {
+    final app = AppScope.of(context);
+    final steps = app.registrationSteps;
+    app.registrationSteps = false;
+    if (app.offerBiometrics) {
+      if (steps) {
+        await Navigator.of(context).push<void>(MaterialPageRoute(builder: (_) => const BiometricOfferScreen(steps: true)));
+      } else {
+        await _offerBiometrics();
+      }
+    }
+    if (!mounted || !app.offerCards) return;
+    app.offerCards = false;
+    await _offerCards(steps: steps);
+  }
+
+  /// «Входить по Face ID?» — биометрия привязывается только по «Включить». Закрыли шторку — спросим
+  /// при следующем входе; «Не сейчас» — больше не спрашиваем.
+  Future<void> _offerBiometrics() async {
+    final app = AppScope.of(context);
+    final s = app.s;
+    final ios = defaultTargetPlatform == TargetPlatform.iOS;
+    final answer = await showQSheet<bool>(context, (context) {
+      return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Center(
+          child: Container(
+            width: 64,
+            height: 64,
+            alignment: Alignment.center,
+            decoration: const BoxDecoration(color: Q.accentSoft, shape: BoxShape.circle),
+            child: ios ? const FaceIdIcon(size: 32) : const Icon(Icons.fingerprint_rounded, size: 32, color: Q.accent),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Text(s.t(ios ? 'bioOfferFace' : 'bioOfferFinger'), textAlign: TextAlign.center, style: Q.titleM.copyWith(color: Q.ink)),
+        const SizedBox(height: 8),
+        Text(s.t('bioOfferHint'), textAlign: TextAlign.center, style: Q.body),
+        const SizedBox(height: 24),
+        QButton(label: s.t('enable'), onPressed: () => Navigator.pop(context, true)),
+        const SizedBox(height: 8),
+        QButton(kind: QButtonKind.secondary, label: s.t('notNow'), onPressed: () => Navigator.pop(context, false)),
+      ]);
+    });
+    if (answer == null) {
+      app.offerBiometrics = false;
+      return;
+    }
+    final ok = await app.answerBiometrics(answer);
+    if (answer && !ok && mounted) showError(context, s.t('bioFailed'));
+  }
+
+  /// Face ID, если биометрия привязана, иначе код (его проверяет сервер).
+  Future<bool> _confirmDetails() async {
+    final until = _detailsUntil;
+    if (until != null && DateTime.now().isBefore(until)) return true;
+    final app = AppScope.of(context);
+    final ok = app.biometricReady ? await app.confirmWithBiometrics() : await _confirmWithPin();
+    if (ok) _detailsUntil = DateTime.now().add(const Duration(minutes: 5));
+    return ok;
+  }
+
+  Future<bool> _confirmWithPin() async {
+    final app = AppScope.of(context);
+    final s = app.s;
+    final ok = await showQSheet<bool>(context, (context) {
+      return Column(mainAxisSize: MainAxisSize.min, children: [
+        Text(s.t('confirmTitle'), textAlign: TextAlign.center, style: Q.titleM.copyWith(color: Q.ink)),
+        const SizedBox(height: 8),
+        Text(s.t('confirmReason'), textAlign: TextAlign.center, style: Q.body),
+        const SizedBox(height: 24),
+        PinPad(
+          deleteLabel: s.t('pinDelete'),
+          onSubmit: (pin) async {
+            try {
+              await app.confirmWithPin(pin);
+              if (context.mounted) Navigator.pop(context, true);
+              return true;
+            } on ApiError catch (e) {
+              if (context.mounted) showError(context, app.s.error(e.code, e.detail));
+              if (!app.loggedIn && context.mounted) Navigator.pop(context, false);
+              return false;
+            }
+          },
+        ),
+        const SizedBox(height: 16),
+      ]);
+    });
+    return ok == true;
+  }
+
+  Future<void> _offerCards({bool steps = false}) async {
     final app = AppScope.of(context);
     try {
       final list = await CardsApi(app.api).list();
       if (!mounted || list.items.isNotEmpty) return;
       await Navigator.of(context).push<BankCard>(
-        MaterialPageRoute(builder: (_) => const AddCardScreen(onboarding: true)),
+        MaterialPageRoute(builder: (_) => AddCardScreen(onboarding: true, steps: steps)),
       );
     } catch (_) {
       // Не получилось узнать про карты — не мешаем: привязать можно в настройках.
     }
   }
 
+  /// Оборот открывается закрытым; реквизиты — по «Показать» после Face ID или кода.
   void _onCardSide(bool back) {
-    if (back) {
-      _loadSecret();
-    } else {
-      _hideCvv();
+    if (!back) _closeDetails();
+  }
+
+  void _closeDetails() {
+    _detailsUntil = null;
+    _cvvTimer?.cancel();
+    if (mounted && (_revealed || _cvv)) {
+      setState(() {
+        _revealed = false;
+        _cvv = false;
+      });
     }
   }
 
-  Future<void> _loadSecret() async {
+  Future<void> _revealDetails() async {
+    if (!await _confirmDetails() || !mounted) return;
+    if (await _loadSecret() && mounted) setState(() => _revealed = true);
+  }
+
+  /// Реквизиты запрашиваются один раз и живут в памяти до выхода из аккаунта.
+  Future<bool> _loadSecret() async {
     final app = AppScope.of(context);
-    if (app.virtualSecret != null || _fetchingSecret) return;
+    if (app.virtualSecret != null) return true;
+    if (_fetchingSecret) return false;
     _fetchingSecret = true;
     try {
-      final secret = await CardsApi(app.api).virtualSecret();
-      app.virtualSecret = secret;
-      if (mounted) setState(() {});
+      app.virtualSecret = await CardsApi(app.api).virtualSecret();
+      return true;
     } on ApiError catch (e) {
       if (mounted) showError(context, app.s.error(e.code, e.detail));
+      return false;
     } finally {
       _fetchingSecret = false;
     }
@@ -128,8 +241,9 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_cvv && mounted) setState(() => _cvv = false);
   }
 
-  void _toggleCvv() {
+  Future<void> _toggleCvv() async {
     if (_cvv) return _hideCvv();
+    if (!await _confirmDetails() || !mounted) return;
     setState(() => _cvv = true);
     _cvvTimer = Timer(const Duration(seconds: 30), _hideCvv);
   }
@@ -218,55 +332,60 @@ class _HomeScreenState extends State<HomeScreen> {
                   ]),
                 ),
                 const SizedBox(height: 16),
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: hiding ? _toggleReveal : null,
-                  child: Semantics(
-                    hint: hiding ? s.t('tapToShow') : null,
-                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      SizedBox(
-                        height: 20,
-                        child: Row(children: [
-                          Text(s.t('balance'), style: Q.label.copyWith(color: Q.ink2, fontWeight: FontWeight.w400)),
-                          if (hiding) ...[
-                            const SizedBox(width: 8),
-                            Icon(shown ? Icons.visibility_outlined : Icons.visibility_off_outlined, size: 16, color: Q.ink2),
-                          ],
-                        ]),
-                      ),
-                      const SizedBox(height: 4),
-                      SizedBox(
-                        height: 48,
-                        child: Row(children: [
-                          Flexible(
-                            child: FittedBox(
-                              fit: BoxFit.scaleDown,
+                Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  Expanded(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: hiding ? _toggleReveal : null,
+                      child: Semantics(
+                        hint: hiding ? s.t('tapToShow') : null,
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          SizedBox(
+                            height: 20,
+                            child: Row(children: [
+                              Text(
+                                shown ? s.t('balance') : s.t('showBalance'),
+                                style: Q.label.copyWith(
+                                  color: shown ? Q.ink2 : Q.accentInk,
+                                  fontWeight: shown ? FontWeight.w400 : FontWeight.w600,
+                                ),
+                              ),
+                              if (hiding) ...[
+                                const SizedBox(width: 8),
+                                Icon(shown ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+                                    size: 16, color: shown ? Q.ink2 : Q.accentInk),
+                              ],
+                            ]),
+                          ),
+                          const SizedBox(height: 4),
+                          SizedBox(
+                            height: 48,
+                            child: Align(
                               alignment: AlignmentDirectional.centerStart,
-                              child: RollingAmount(
-                                money(profile['balance'] as int),
-                                style: Q.balance.copyWith(color: Q.ink),
-                                hidden: !shown,
-                                rollIn: shown,
+                              child: FittedBox(
+                                fit: BoxFit.scaleDown,
+                                alignment: AlignmentDirectional.centerStart,
+                                child: RollingAmount(
+                                  money(profile['balance'] as int),
+                                  style: Q.balance.copyWith(color: Q.ink),
+                                  hidden: !shown,
+                                  rollIn: shown,
+                                ),
                               ),
                             ),
                           ),
-                          if (!shown) ...[
-                            const SizedBox(width: 12),
-                            ConstrainedBox(
-                              constraints: const BoxConstraints(maxWidth: 184),
-                              child: Text(s.t('tapToShow'),
-                                  maxLines: 2,
-                                  style: const TextStyle(
-                                      fontSize: 14, height: 20 / 14, fontWeight: FontWeight.w600, color: Q.accentInk)),
-                            ),
-                          ],
                         ]),
                       ),
-                    ]),
+                    ),
                   ),
-                ),
+                  const SizedBox(width: 12),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: _Pill(icon: Icons.add_rounded, label: s.t('topup'), onTap: () => _open(const TopupScreen())),
+                  ),
+                ]),
                 const SizedBox(height: 16),
-                // Долгое нажатие или свайп переворачивают карту: на обороте реквизиты учебной карты.
+                // Нажатие или свайп переворачивают карту: на обороте реквизиты учебной карты, закрытые до Face ID.
                 FlipCard(
                   semanticLabel: s.t('flipCard'),
                   onSide: _onCardSide,
@@ -281,15 +400,22 @@ class _HomeScreenState extends State<HomeScreen> {
                     badge: s.t('training'),
                     last4: '${profile['card_last4'] ?? '••••'}',
                     expiryLabel: s.t('expiryShort'),
-                    number: app.virtualSecret?.number,
-                    expiry: app.virtualSecret?.expiry,
-                    cvv: app.virtualSecret?.cvv,
+                    number: _revealed ? app.virtualSecret?.number : null,
+                    expiry: _revealed ? app.virtualSecret?.expiry : null,
+                    cvv: _revealed ? app.virtualSecret?.cvv : null,
                     cvvShown: _cvv,
+                    revealed: _revealed,
+                    confirmCaption: s.t('confirmToShow'),
+                    revealLabel: s.t('show'),
+                    onReveal: _revealDetails,
+                    biometricIcon: defaultTargetPlatform == TargetPlatform.iOS
+                        ? const FaceIdIcon(size: 20, color: Q.ink)
+                        : const Icon(Icons.fingerprint_rounded, size: 20, color: Q.ink),
                     copyLabel: s.t('copyNumber'),
                     showCvvLabel: s.t('showCvv'),
                     hideCvvLabel: s.t('hideCvv'),
-                    onCopy: app.virtualSecret == null ? null : _copyNumber,
-                    onToggleCvv: app.virtualSecret == null ? null : _toggleCvv,
+                    onCopy: _revealed ? _copyNumber : null,
+                    onToggleCvv: _revealed ? _toggleCvv : null,
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -413,8 +539,27 @@ class _HistoryRow extends StatelessWidget {
     final incoming = item['direction'] == 'in';
     final bluetooth = item['method'] == 'bluetooth';
     final merchant = item['is_merchant'] == true;
+    final method = '${item['method']}';
+    final topup = method == 'topup';
+    final demo = method == 'demo';
     final at = DateTime.fromMillisecondsSinceEpoch(((item['created_at'] as num) * 1000).round());
-    final name = '${item['counterparty']}';
+    final counterparty = '${item['counterparty']}';
+    // «Пополнение с Visa •• 1111» → заголовок «Пополнение с карты», ниже «Visa •• 1111, 24 ноября».
+    final card = counterparty.replaceFirst(RegExp(r'^Пополнение с\s*'), '');
+    final name = topup ? s.t('topupRow') : counterparty;
+    final meta = topup ? '$card, ${s.day(at)}' : s.date(at);
+    final metaIcon = topup
+        ? Icons.credit_card_rounded
+        : demo
+            ? Icons.smart_toy_outlined
+            : bluetooth
+                ? Icons.bluetooth_rounded
+                : Icons.location_on_rounded;
+    final avatar = topup
+        ? AvatarKind.topup
+        : demo
+            ? (merchant ? AvatarKind.botShop : AvatarKind.bot)
+            : (merchant ? AvatarKind.shop : AvatarKind.initial);
     final amount = '${incoming ? '+' : '−'}${money(item['amount'] as int)}';
 
     return ConstrainedBox(
@@ -422,7 +567,7 @@ class _HistoryRow extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 8),
         child: Row(children: [
-          Avatar(name: name, kind: merchant ? AvatarKind.shop : AvatarKind.initial),
+          Avatar(name: name, kind: avatar),
           const SizedBox(width: 12),
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -431,10 +576,10 @@ class _HistoryRow extends StatelessWidget {
               SizedBox(
                 height: 20,
                 child: Row(children: [
-                  Icon(bluetooth ? Icons.bluetooth_rounded : Icons.location_on_rounded, size: 16, color: Q.ink2),
+                  Icon(metaIcon, size: 16, color: Q.ink2),
                   const SizedBox(width: 4),
                   Flexible(
-                    child: Text(s.date(at),
+                    child: Text(meta,
                         maxLines: 1, overflow: TextOverflow.ellipsis, style: Q.secondary.copyWith(fontFeatures: Q.tabular)),
                   ),
                 ]),
@@ -462,4 +607,34 @@ class _HistoryRow extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Пилюля «Пополнить»: 36, accentSoft, иконка 20, текст 15/600.
+class _Pill extends StatelessWidget {
+  const _Pill({required this.icon, required this.label, required this.onTap});
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => Pressable(
+        child: Material(
+          color: Q.accentSoft,
+          shape: const StadiumBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onTap,
+            highlightColor: const Color(0xFFD2E9E4),
+            child: Container(
+              height: 36,
+              padding: const EdgeInsets.only(left: 8, right: 12),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(icon, size: 20, color: Q.accentInk),
+                const SizedBox(width: 4),
+                Text(label, style: Q.label.copyWith(color: Q.accentInk)),
+              ]),
+            ),
+          ),
+        ),
+      );
 }

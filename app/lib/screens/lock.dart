@@ -52,7 +52,9 @@ class _LockScreenState extends State<LockScreen> {
   Widget build(BuildContext context) {
     final app = AppScope.of(context);
     final s = app.s;
-    final name = '${app.profile?['name'] ?? ''}'.split(' ').first;
+    // При холодном старте профиля нет: имя берётся из защищённого хранилища.
+    final fromProfile = '${app.profile?['name'] ?? ''}'.trim().split(' ').first;
+    final name = fromProfile.isNotEmpty ? fromProfile : (app.savedName ?? '');
     final ios = defaultTargetPlatform == TargetPlatform.iOS;
     return Scaffold(
       appBar: QAppBar(
@@ -73,12 +75,12 @@ class _LockScreenState extends State<LockScreen> {
         top: false,
         child: Column(children: [
           const SizedBox(height: 16),
-          Avatar(name: name, kind: AvatarKind.me, size: 64),
+          if (name.isNotEmpty) Avatar(name: name, kind: AvatarKind.me, size: 64) else const QasyndaMark(size: 64),
           const SizedBox(height: 16),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: Q.gutter),
             child: Column(children: [
-              Text(s.t('hello', {'name': name}), textAlign: TextAlign.center, style: Q.titleM.copyWith(color: Q.ink)),
+              Text(name.isEmpty ? s.t('helloNoName') : s.t('hello', {'name': name}), textAlign: TextAlign.center, style: Q.titleM.copyWith(color: Q.ink)),
               const SizedBox(height: 8),
               Text(s.t('lockTitle'), textAlign: TextAlign.center, style: Q.body),
             ]),

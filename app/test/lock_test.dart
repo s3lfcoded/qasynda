@@ -44,6 +44,46 @@ Future<void> Function(WidgetTester) _quiet(Future<void> Function(WidgetTester) b
     };
 
 void main() {
+  testWidgets('system dialogs (inactive) do not lock, going to the background locks at once', _quiet((tester) async {
+    final state = AppState()
+      ..ready = true
+      ..profile = _profile();
+    state.api.token = 'session';
+    await tester.pumpWidget(QasyndaApp(state: state));
+    await tester.pump();
+    tester.takeException();
+
+    // Face ID, разрешение камеры, вставка из буфера: только inactive.
+    await _lifecycle(tester, [AppLifecycleState.inactive, AppLifecycleState.resumed]);
+    expect(state.locked, isFalse);
+    expect(find.byType(HomeScreen), findsOneWidget);
+
+    // Свернули на секунду — код спрашивается сразу, ещё до возврата.
+    await _lifecycle(tester, [AppLifecycleState.inactive, AppLifecycleState.hidden]);
+    expect(state.locked, isTrue);
+    await _lifecycle(tester, [AppLifecycleState.paused, AppLifecycleState.hidden, AppLifecycleState.inactive, AppLifecycleState.resumed]);
+    await tester.pump(const Duration(seconds: 1));
+    tester.takeException();
+    expect(find.byType(LockScreen), findsOneWidget);
+  }));
+
+  testWidgets('lock screen greets by the first name saved before, even without a profile', _quiet((tester) async {
+    final store = <String, String>{'token': 'session-token', 'first_name': 'Айгерим', 'server': 'http://127.0.0.1:9'};
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(_storageChannel, (call) async {
+      final args = (call.arguments as Map).cast<String, Object?>();
+      return call.method == 'read' ? store[args['key']] : null;
+    });
+    final state = AppState();
+    await tester.runAsync(() => state.boot());
+    await tester.pumpWidget(QasyndaApp(state: state));
+    await tester.pump();
+    tester.takeException();
+    expect(state.profile, isNull);
+    expect(find.byType(LockScreen), findsOneWidget);
+    expect(find.text('Здравствуйте, Айгерим'), findsOneWidget);
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 200)));
+  }));
+
   testWidgets('screens opened before the lock are closed when the app locks', _quiet((tester) async {
     final state = AppState()
       ..ready = true
@@ -58,8 +98,8 @@ void main() {
     await tester.pump(const Duration(seconds: 1));
     expect(find.byType(SettingsScreen), findsOneWidget);
 
+    // Блокировка — сразу при уходе в фон, без минуты ожидания.
     await _lifecycle(tester, [AppLifecycleState.inactive, AppLifecycleState.hidden, AppLifecycleState.paused]);
-    await tester.runAsync(() => Future<void>.delayed(const Duration(seconds: 61)));
     await _lifecycle(tester, [AppLifecycleState.hidden, AppLifecycleState.inactive, AppLifecycleState.resumed]);
     await tester.pump(const Duration(seconds: 1));
     tester.takeException();

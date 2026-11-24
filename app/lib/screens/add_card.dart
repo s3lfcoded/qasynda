@@ -17,11 +17,14 @@ import 'card_scan.dart';
 /// Возвращает привязанную карту через Navigator.pop.
 /// [onboarding] — экран после первого входа: вместо «назад» кнопка «Позже».
 class AddCardScreen extends StatefulWidget {
-  const AddCardScreen({super.key, this.scan, this.onboarding = false});
+  const AddCardScreen({super.key, this.scan, this.onboarding = false, this.steps = false});
 
   /// Сканер для тестов; по умолчанию — экран камеры.
   final Future<ScannedCard?> Function(BuildContext context)? scan;
   final bool onboarding;
+
+  /// Последний шаг регистрации: полоска шагов заполнена целиком.
+  final bool steps;
 
   @override
   State<AddCardScreen> createState() => _AddCardScreenState();
@@ -238,7 +241,11 @@ class _AddCardScreenState extends State<AddCardScreen> {
       child: Scaffold(
         appBar: _manual
             ? QAppBar(title: t.t('addTitle'), onBack: () => setState(() => _manual = false))
-            : QAppBar(back: !widget.onboarding, actions: [if (widget.onboarding) later]),
+            : QAppBar(
+                back: !widget.onboarding,
+                middle: widget.steps ? const StepsBar(count: 4, done: 4, end: 12) : null,
+                actions: [if (widget.onboarding) later],
+              ),
         body: SafeArea(top: false, child: _manual ? _form(t) : _methods(t)),
       ),
     );

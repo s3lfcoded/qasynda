@@ -12,8 +12,11 @@ export 'widgets/rolling_amount.dart';
 
 /// Шапка 56: кнопка «назад» 44×44 в 8 от края, заголовок 17/600 через 4 после неё.
 class QAppBar extends StatelessWidget implements PreferredSizeWidget {
-  const QAppBar({super.key, this.title, this.back = true, this.onBack, this.actions = const []});
+  const QAppBar({super.key, this.title, this.back = true, this.onBack, this.actions = const [], this.middle});
   final String? title;
+
+  /// Вместо заголовка, например полоска шагов регистрации.
+  final Widget? middle;
   final bool back;
   final VoidCallback? onBack;
   final List<Widget> actions;
@@ -38,7 +41,9 @@ class QAppBar extends StatelessWidget implements PreferredSizeWidget {
               icon: const Icon(Icons.arrow_back_rounded, color: Q.ink),
             ),
           const SizedBox(width: 4),
-          if (title != null)
+          if (middle != null)
+            Expanded(child: middle!)
+          else if (title != null)
             Expanded(
               child: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis, style: Q.appBar.copyWith(color: Q.ink)),
             )
@@ -96,6 +101,7 @@ class QButton extends StatelessWidget {
     this.kind = QButtonKind.primary,
     this.icon,
     this.busy = false,
+    this.busyLabel,
   });
 
   final String label;
@@ -103,6 +109,9 @@ class QButton extends StatelessWidget {
   final QButtonKind kind;
   final IconData? icon;
   final bool busy;
+
+  /// Подпись рядом с индикатором, пока идёт долгое ожидание («Сервер просыпается…»).
+  final String? busyLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -118,7 +127,7 @@ class QButton extends StatelessWidget {
         onPressed: busy ? () {} : onPressed,
         style: ButtonStyle(
           backgroundColor: WidgetStateProperty.resolveWith((states) {
-            if (busy) return bg;
+            if (busy) return busyLabel != null ? press : bg;
             if (states.contains(WidgetState.disabled)) return Q.surface2;
             if (states.contains(WidgetState.pressed)) return press;
             return bg;
@@ -127,7 +136,13 @@ class QButton extends StatelessWidget {
               (states) => states.contains(WidgetState.disabled) ? Q.ink3 : fg),
         ),
         child: busy
-            ? SizedBox.square(dimension: 22, child: CircularProgressIndicator(strokeWidth: 2.5, color: fg))
+            ? Row(mainAxisSize: MainAxisSize.min, children: [
+                SizedBox.square(dimension: 20, child: CircularProgressIndicator(strokeWidth: 2.5, color: fg)),
+                if (busyLabel != null) ...[
+                  const SizedBox(width: 12),
+                  Flexible(child: Text(busyLabel!, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: fg))),
+                ],
+              ])
             : Row(mainAxisSize: MainAxisSize.min, children: [
                 if (icon != null) ...[Icon(icon, size: 20), const SizedBox(width: 8)],
                 Flexible(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis)),
@@ -239,7 +254,7 @@ class _Segment extends StatelessWidget {
   }
 }
 
-enum AvatarKind { initial, shop, me }
+enum AvatarKind { initial, shop, me, bot, botShop, topup }
 
 /// Аватар 48: инициал на surface2, «я» на accentSoft, ИП — скруглённый квадрат с витриной.
 class Avatar extends StatelessWidget {
@@ -250,24 +265,32 @@ class Avatar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final soft = kind != AvatarKind.initial;
+    final (bg, fg) = switch (kind) {
+      AvatarKind.initial => (Q.surface2, Q.ink),
+      AvatarKind.shop || AvatarKind.me || AvatarKind.topup => (Q.accentSoft, Q.accentInk),
+      AvatarKind.bot || AvatarKind.botShop => (Q.botSoft, Q.botInk),
+    };
+    final square = kind == AvatarKind.shop || kind == AvatarKind.botShop;
+    final icon = switch (kind) {
+      AvatarKind.shop => Icons.storefront_rounded,
+      AvatarKind.botShop => Icons.local_cafe_rounded,
+      AvatarKind.topup => Icons.add_rounded,
+      _ => null,
+    };
     return Container(
       width: size,
       height: size,
       alignment: Alignment.center,
-      decoration: BoxDecoration(
-        color: soft ? Q.accentSoft : Q.surface2,
-        borderRadius: BorderRadius.circular(kind == AvatarKind.shop ? 16 : size / 2),
-      ),
-      child: kind == AvatarKind.shop
-          ? Icon(Icons.storefront_rounded, color: Q.accentInk, size: size / 2)
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(square ? 16 : size / 2)),
+      child: icon != null
+          ? Icon(icon, color: fg, size: size / 2)
           : Text(name.isEmpty ? '?' : name.characters.first.toUpperCase(),
-              style: TextStyle(fontSize: size * 0.375, height: 1, fontWeight: FontWeight.w600, color: soft ? Q.accentInk : Q.ink)),
+              style: TextStyle(fontSize: size * 0.375, height: 1, fontWeight: FontWeight.w600, color: fg)),
     );
   }
 }
 
-enum TagKind { bluetooth, gps, merchant, neutral }
+enum TagKind { bluetooth, gps, merchant, neutral, bot }
 
 /// Тег 24: Bluetooth — бирюзовый, GPS — янтарный, «ИП в банке» — белый с галочкой.
 class QTag extends StatelessWidget {
@@ -282,6 +305,7 @@ class QTag extends StatelessWidget {
       TagKind.gps => (Q.amberSoft, Q.amberInk, Icons.location_on_rounded, Q.amberInk),
       TagKind.merchant => (Q.bg, Q.ink, Icons.verified_rounded, Q.accent),
       TagKind.neutral => (Q.surface2, Q.ink, null, Q.ink),
+      TagKind.bot => (Q.botSoft, Q.botInk, Icons.smart_toy_rounded, Q.botInk),
     };
     return Container(
       height: 24,
@@ -685,4 +709,53 @@ class QNote extends StatelessWidget {
         const SizedBox(width: 12),
         Expanded(child: Text(text, style: Q.secondary)),
       ]);
+}
+
+/// Полоска шагов регистрации: сегменты 4 pt, зазор 4, заполненные — accent.
+class StepsBar extends StatelessWidget {
+  const StepsBar({super.key, required this.count, required this.done, this.end = 56});
+  final int count;
+  final int done;
+
+  /// Отступ справа: по умолчанию как кнопка «назад» слева, чтобы полоска стояла по центру.
+  final double end;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: EdgeInsets.only(left: 8, right: end),
+        child: Row(children: [
+          for (var i = 0; i < count; i++) ...[
+            if (i > 0) const SizedBox(width: 4),
+            Expanded(
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 240),
+                height: 4,
+                decoration: BoxDecoration(color: i < done ? Q.accent : Q.surface2, borderRadius: BorderRadius.circular(2)),
+              ),
+            ),
+          ],
+        ]),
+      );
+}
+
+/// Янтарная плашка «учебное»: иконка 20, текст 13/16, радиус 16, от 40 в высоту.
+class Plaque extends StatelessWidget {
+  const Plaque({super.key, required this.text, this.icon = Icons.school_outlined, this.center = false});
+  final String text;
+  final IconData icon;
+  final bool center;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        constraints: const BoxConstraints(minHeight: 40),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(color: Q.amberSoft, borderRadius: BorderRadius.circular(16)),
+        child: Row(mainAxisAlignment: center ? MainAxisAlignment.center : MainAxisAlignment.start, children: [
+          Icon(icon, size: 20, color: Q.amberInk),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(text, style: const TextStyle(fontSize: 13, height: 16 / 13, fontWeight: FontWeight.w600, color: Q.amberInk)),
+          ),
+        ]),
+      );
 }

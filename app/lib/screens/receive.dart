@@ -33,6 +33,28 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
   String? _bleId;
   bool _disposed = false;
 
+  /// Учебный бот Алия: просьба перевести 5 000 ₸. null — кнопки нет (не учебный режим).
+  bool _aliyaAvailable = true;
+  bool _aliyaSending = false;
+  static const _aliyaAmount = 5000 * 100;
+
+  Future<void> _askAliya() async {
+    setState(() => _aliyaSending = true);
+    try {
+      await _app.api.post('/demo/request', {'amount': _aliyaAmount});
+      // Перевод придёт по WebSocket как обычное поступление.
+    } on ApiError catch (e) {
+      if (!mounted) return;
+      if (e.code == 'not_found') {
+        setState(() => _aliyaAvailable = false);
+      } else {
+        showError(context, _app.s.error(e.code, e.detail));
+      }
+    } finally {
+      if (mounted) setState(() => _aliyaSending = false);
+    }
+  }
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -160,13 +182,14 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
                   ? [
                       Center(
                         child: RadiusRings(
+                          size: 192,
                           child: Container(
-                            width: 80,
-                            height: 80,
+                            width: 64,
+                            height: 64,
                             alignment: Alignment.center,
                             decoration: const BoxDecoration(color: Q.accent, shape: BoxShape.circle),
                             child: Text(initial.isEmpty ? '' : initial.characters.first.toUpperCase(),
-                                style: const TextStyle(fontSize: 28, height: 1, fontWeight: FontWeight.w600, color: Q.onAccent)),
+                                style: const TextStyle(fontSize: 24, height: 1, fontWeight: FontWeight.w600, color: Q.onAccent)),
                           ),
                         ),
                       ),
@@ -248,6 +271,21 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
                     ],
             ),
           ),
+          if (_aliyaAvailable && last == null) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: Q.gutter),
+              child: _BotButton(
+                label: _aliyaSending ? s.t('aliyaSending') : s.t('askAliya', {'sum': money(_aliyaAmount)}),
+                busy: _aliyaSending,
+                onPressed: _aliyaSending ? null : _askAliya,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(Q.gutter + 16, 8, Q.gutter + 16, 16),
+              child: Text(s.t('aliyaHint'),
+                  textAlign: TextAlign.center, style: const TextStyle(fontSize: 13, height: 16 / 13, color: Q.ink2)),
+            ),
+          ],
           Padding(
             padding: const EdgeInsets.fromLTRB(Q.gutter, 0, Q.gutter, 8),
             child: QButton(label: s.t('done'), onPressed: () => Navigator.pop(context)),
@@ -256,4 +294,42 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
       ),
     );
   }
+}
+
+/// Кнопка учебного бота: botSoft, текст botInk, иконка smart_toy.
+class _BotButton extends StatelessWidget {
+  const _BotButton({required this.label, required this.onPressed, this.busy = false});
+  final String label;
+  final VoidCallback? onPressed;
+  final bool busy;
+
+  @override
+  Widget build(BuildContext context) => Pressable(
+        enabled: onPressed != null,
+        child: Material(
+          color: Q.botSoft,
+          borderRadius: BorderRadius.circular(16),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onPressed,
+            highlightColor: const Color(0xFFD9E1EF),
+            child: SizedBox(
+              height: 56,
+              child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                if (busy)
+                  const SizedBox.square(dimension: 20, child: CircularProgressIndicator(strokeWidth: 2.5, color: Q.botInk))
+                else
+                  const Icon(Icons.smart_toy_rounded, size: 20, color: Q.botInk),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 17, height: 24 / 17, fontWeight: FontWeight.w600, color: Q.botInk, fontFeatures: Q.tabular)),
+                ),
+              ]),
+            ),
+          ),
+        ),
+      );
 }

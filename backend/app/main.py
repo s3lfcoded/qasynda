@@ -5,10 +5,12 @@ import asyncio
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -18,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from . import cards, db, guard, nearby, notes, sms
+from . import cards, db, demo, guard, nearby, notes, sms
 
 # Лимит одного перевода в тиынах. Близость по Bluetooth подделать труднее, чем координаты,
 # поэтому перевод только по GPS ограничен жёстче.
@@ -58,6 +60,19 @@ _transfer_rate = guard.Window(10, 60)
 _pair_rate = guard.Window(3, 600)            # одному и тому же получателю
 _card_add_rate = guard.Window(5, 3600)       # привязанных карт за час
 _card_secret_rate = guard.Window(10, 3600)   # показов реквизитов виртуальной карты за час
+# Регистрация: с одного адреса (если сервер его знает) и всего на сервер — учебный стенд, а не банк.
+_register_ip = guard.Window(5, 3600)
+_register_all = guard.Window(30, 3600)
+_topup_rate = guard.Window(10, 60)
+_demo_request_rate = guard.Window(5, 3600)   # «попросить у Алии»
+
+# Учебное пополнение с привязанной карты.
+TOPUP_MIN = 100_00
+TOPUP_MAX = 500_000_00
+TOPUP_DAILY = 1_000_000_00
+# Сколько Алия может прислать по просьбе за раз и через сколько секунд возвращает перевод.
+DEMO_REQUEST_MAX = 20_000_00
+BOT_RETURN_DELAY = 3.0
 
 HexId = Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")]
 # Сколько услышанных меток учитывается. Остальные отбрасываются: иначе передатчик, рассылающий сотни
@@ -88,6 +103,21 @@ class StartIn(BaseModel):
 class CodeIn(BaseModel):
     challenge: Challenge
     code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class RegisterIn(BaseModel):
+    challenge: Challenge
+    name: str = Field(max_length=200)
+    pin: str = Field(pattern=r"^[0-9]{4}$")
+
+
+class TopupIn(BaseModel):
+    card_id: str = Field(pattern=r"^[0-9a-f]{16}$")
+    amount: int = Field(gt=0, le=10**12)
+
+
+class DemoRequestIn(BaseModel):
+    amount: int = Field(gt=0, le=10**12)
 
 
 class LoginIn(BaseModel):
@@ -297,6 +327,7 @@ async def lifespan(_: FastAPI):
     db.init()
     if os.environ.get("QASYNDA_SEED_DEMO") == "1":
         db.seed_demo()
+        db.seed_bots()
     hub.loop = asyncio.get_running_loop()
     yield
     hub.loop = None
@@ -429,9 +460,14 @@ def profile(user: dict) -> dict:
     }
 
 
+def display_name(user: dict) -> str:
+    """Как человека видят другие: «Айгерим К.». Учебных ботов — полным именем: это не настоящие люди."""
+    return user["full_name"] if user.get("is_bot") else short_name(user["full_name"])
+
+
 def public_card(user: dict) -> dict:
     return {
-        "name": short_name(user["full_name"]),
+        "name": display_name(user),
         "is_merchant": bool(user["is_merchant"]),
         "business_name": user["business_name"] if user["is_merchant"] else None,
     }
@@ -486,22 +522,23 @@ def start(body: StartIn, request: Request) -> dict:
 @app.post("/auth/code")
 def sms_code(body: CodeIn) -> dict:
     """Код из SMS. Попытка засчитывается до сравнения и под блокировкой, поэтому параллельные запросы
-    не дают больше пяти попыток на одно SMS; после пятой ошибки запрос закрывается. Верный код только
-    открывает шаг PIN — счётчики PIN владельца он не трогает. Для несуществующего номера код
-    принимается так же, а отказ приходит уже на шаге PIN, как при неверном PIN."""
+    не дают больше пяти попыток на одно SMS; после пятой ошибки запрос закрывается. Верный код открывает
+    следующий шаг: PIN (/auth/confirm), если аккаунт есть, или регистрацию (/auth/register), если нет.
+    Есть ли аккаунт, сообщается только после верного кода. Счётчики PIN владельца код не трогает."""
     pending = _challenges.get(body.challenge)
     if pending is None:
         raise fail(401, "challenge_expired")
     with _challenges.lock:
-        if pending["verified"]:
-            return {"next": "pin"}
-        if pending["attempts"] >= SMS_ATTEMPTS:
-            raise fail(401, "challenge_expired")
-        pending["attempts"] += 1
-        if hmac.compare_digest(_sha(body.code), pending["code"]):
-            pending["verified"] = True
-            return {"next": "pin"}
+        ok = pending["verified"]
+        if not ok:
+            if pending["attempts"] >= SMS_ATTEMPTS:
+                raise fail(401, "challenge_expired")
+            pending["attempts"] += 1
+            ok = pending["verified"] = hmac.compare_digest(_sha(body.code), pending["code"])
         left = SMS_ATTEMPTS - pending["attempts"]
+    if ok:
+        # Номер уже доказан кодом из SMS, поэтому теперь можно сказать, есть ли по нему аккаунт.
+        return {"ok": True, "registered": db.user_by_phone(pending["phone"]) is not None}
     if left <= 0:
         _challenges.pop(body.challenge)
         raise fail(401, "challenge_expired")
@@ -536,7 +573,7 @@ def confirm(body: ConfirmIn, request: Request) -> dict:
     if not verified:
         raise fail(401, "code_required")
 
-    user = db.user_by_id(pending["user_id"]) if pending["user_id"] else None
+    user = db.user_by_phone(pending["phone"])
     key = ("new_device", pending["phone"])
     gates = pin_gate(key, client_ip(request))
     if not db.check_pin(user, body.pin):
@@ -547,6 +584,56 @@ def confirm(body: ConfirmIn, request: Request) -> dict:
     device_id = db.add_device(user["id"], pending["device_secret"], pending["device_name"])
     hub.notify(user["id"], {"type": "new_device", "name": pending["device_name"]}, skip_device=device_id)
     return signed_in(user["id"], device_id)
+
+
+NAME_RE = re.compile(r"[^\W\d_]+(?:[ -][^\W\d_]+)*")
+
+
+def weak_pin(pin: str) -> bool:
+    """Все цифры одинаковые, подряд по возрастанию или убыванию (1234, 4321, 0123…) или пара повторяется (1212)."""
+    steps = {int(b) - int(a) for a, b in zip(pin, pin[1:])}
+    return len(steps) == 1 and steps <= {-1, 0, 1} or pin[:2] == pin[2:]
+
+
+@app.post("/auth/register")
+def register(body: RegisterIn, request: Request) -> dict:
+    """Регистрация после верного кода из SMS, если по номеру ещё нет аккаунта. Запрос входа одноразовый:
+    после регистрации им не войти и не зарегистрироваться второй раз."""
+    pending = _challenges.get(body.challenge)
+    if pending is None:
+        raise fail(401, "challenge_expired")
+    with _challenges.lock:
+        verified = pending["verified"]
+    if not verified:
+        raise fail(401, "code_required")
+    name = " ".join(body.name.split())
+    if not 2 <= len(name) <= 60 or not NAME_RE.fullmatch(name):
+        raise fail(422, "invalid_name")
+    if weak_pin(body.pin):
+        raise fail(422, "weak_pin")
+    if db.user_by_phone(pending["phone"]):
+        raise fail(409, "already_registered")
+
+    ip = client_ip(request)
+    gates: list[tuple[guard.Window, object]] = [(_register_all, "all")]
+    if ip:
+        gates.append((_register_ip, ip))
+    if wait := guard.take_all(gates):
+        raise slow_down(wait)
+
+    def undo() -> None:
+        for window, key in gates:
+            window.refund(key)
+
+    if _challenges.pop(body.challenge) is None:
+        undo()
+        raise fail(401, "challenge_expired")
+    user_id = db.create_user(pending["phone"], body.pin, name, cards.virtual_last4)
+    if user_id is None:
+        undo()
+        raise fail(409, "already_registered")
+    device_id = db.add_device(user_id, pending["device_secret"], pending["device_name"])
+    return signed_in(user_id, device_id)
 
 
 @app.post("/auth/unlock")
@@ -734,6 +821,10 @@ def discover(body: DiscoverIn, user: Unlocked) -> dict:
         if other:
             limit = LIMIT_BLUETOOTH if entry["method"] == "bluetooth" else LIMIT_GPS
             people.append({**entry, **public_card(other), "limit": limit})
+    for bot in demo.bots():
+        if bot["id"] != user["id"]:
+            people.append({"public_id": demo.public_id(bot), "method": "demo", "proximity": "demo",
+                           **public_card(bot), "limit": LIMIT_GPS})
     return {"people": people, "gps": gps, "min_amount": MIN_AMOUNT}
 
 
@@ -747,10 +838,12 @@ def transfer(body: TransferIn, user: Unlocked) -> dict:
             raise fail(409, "idempotency_conflict")
         return receipt(existing, user["id"])
 
-    beacon = nearby.by_public(body.public_id)
-    if not beacon:
+    bot = demo.by_public(body.public_id)
+    beacon = None if bot else nearby.by_public(body.public_id)
+    if not bot and not beacon:
         raise fail(404, "recipient_not_available")
-    if beacon.user_id == user["id"]:
+    recipient_id = bot["id"] if bot else beacon.user_id
+    if recipient_id == user["id"]:
         raise fail(400, "self_transfer")
     if body.amount < MIN_AMOUNT:
         raise fail(422, "amount_too_small", min=MIN_AMOUNT)
@@ -758,9 +851,12 @@ def transfer(body: TransferIn, user: Unlocked) -> dict:
 
     # Способ подтверждения близости определяет сервер, а не клиент.
     # Клиент присылает все маяки, которые сейчас слышит по Bluetooth; какой из них чей, знает только сервер.
+    # Учебному боту доказательство не нужно, но лимиты у него как у перевода по GPS.
     loc, _ = trusted_location(user["id"], body.location)
-    valid = beacon.ble_ids(nearby.clock())
-    if any(hmac.compare_digest(seen, ble) for seen in body.ble_ids[:MAX_BLE_IDS] for ble in valid):
+    if bot:
+        method, limit = "demo", LIMIT_GPS
+    elif any(hmac.compare_digest(seen, ble) for seen in body.ble_ids[:MAX_BLE_IDS]
+             for ble in beacon.ble_ids(nearby.clock())):
         method, limit = "bluetooth", LIMIT_BLUETOOTH
     elif loc and nearby.gps_distance(beacon, loc.lat, loc.lon, loc.accuracy) is not None:
         method, limit = "gps", LIMIT_GPS
@@ -769,13 +865,13 @@ def transfer(body: TransferIn, user: Unlocked) -> dict:
     if body.amount > limit:
         raise fail(403, "limit_exceeded", limit=limit, method=method)
 
-    rate = [(_transfer_rate, user["id"]), (_pair_rate, (user["id"], beacon.user_id))]
+    rate = [(_transfer_rate, user["id"]), (_pair_rate, (user["id"], recipient_id))]
     if wait := guard.take_all(rate):
         raise slow_down(wait)
 
-    daily = {None: DAILY_LIMIT, "gps": DAILY_LIMIT_GPS} if method == "gps" else {None: DAILY_LIMIT}
+    daily = {None: DAILY_LIMIT, "gps": DAILY_LIMIT_GPS} if method in ("gps", "demo") else {None: DAILY_LIMIT}
     try:
-        result, created = db.make_transfer(user["id"], beacon.user_id, body.amount, method,
+        result, created = db.make_transfer(user["id"], recipient_id, body.amount, method,
                                            note, body.idempotency_key, daily)
     except db.TransferError as err:
         # Перевод не прошёл — он не должен тратить лимит частоты.
@@ -788,26 +884,59 @@ def transfer(body: TransferIn, user: Unlocked) -> dict:
         raise
 
     reply = receipt(result, user["id"])
-    if created:
-        recipient = db.user_by_id(beacon.user_id)
-        hub.notify(beacon.user_id, {
-            "type": "transfer_received", "id": result["id"], "amount": result["amount"],
-            "method": result["method"], "note": result["note"],
-            "sender": short_name(user["full_name"]), "balance": recipient["balance"],
-        })
+    if created and bot:
+        if bot["phone"] == demo.ALIYA:
+            later(BOT_RETURN_DELAY, lambda: bot_pays(bot, user["id"], result["amount"], f"return-{result['id']}"))
+    elif created:
+        notify_received(recipient_id, result, user)
     return reply
+
+
+def notify_received(recipient_id: int, transfer: dict, sender: dict) -> None:
+    recipient = db.user_by_id(recipient_id)
+    hub.notify(recipient_id, {
+        "type": "transfer_received", "id": transfer["id"], "amount": transfer["amount"],
+        "method": transfer["method"], "note": transfer["note"],
+        "sender": display_name(sender), "balance": recipient["balance"],
+    })
+
+
+def later(delay: float, action) -> None:
+    """Отложенное действие бота. В тестах подменяется немедленным вызовом."""
+    timer = threading.Timer(delay, action)
+    timer.daemon = True
+    timer.start()
+
+
+def bot_pays(bot: dict, user_id: int, amount: int, key: str) -> dict | None:
+    """Перевод от бота. Ключ повтора не даёт боту заплатить дважды за один и тот же перевод."""
+    try:
+        result, created = db.make_transfer(bot["id"], user_id, amount, "demo", None, key)
+    except (db.TransferError, sqlite3.Error):
+        return None
+    if created:
+        notify_received(user_id, result, bot)
+    return result
 
 
 @app.get("/transfers")
 def transfers(user: Unlocked, limit: Annotated[int, Query(ge=1, le=100)] = 30) -> dict:
     items = []
     for row in db.history(user["id"], limit):
+        if row["kind"] == "topup":
+            items.append({
+                "id": row["id"], "direction": "in", "counterparty": topup_title(row["card_brand"], row["card_last4"]),
+                "is_merchant": False, "amount": row["amount"], "method": "topup", "note": None,
+                "created_at": row["created_at"],
+            })
+            continue
         outgoing = row["sender_id"] == user["id"]
         if outgoing:
             business = row["recipient_business"] if row["recipient_is_merchant"] else None
-            counterparty = business or short_name(row["recipient_name"])
+            counterparty = business or (row["recipient_name"] if row["recipient_is_bot"]
+                                        else short_name(row["recipient_name"]))
         else:
-            counterparty = short_name(row["sender_name"])
+            counterparty = row["sender_name"] if row["sender_is_bot"] else short_name(row["sender_name"])
         merchant = row["recipient_is_merchant"] if outgoing else row["sender_is_merchant"]
         items.append({
             "id": row["id"], "direction": "out" if outgoing else "in", "counterparty": counterparty,
@@ -816,6 +945,55 @@ def transfers(user: Unlocked, limit: Annotated[int, Query(ge=1, le=100)] = 30) -
             "created_at": row["created_at"],
         })
     return {"items": items}
+
+
+BRAND_TITLES = {"visa": "Visa", "mastercard": "Mastercard", "unionpay": "UnionPay"}
+
+
+def topup_title(brand: str, last4: str) -> str:
+    """«Пополнение с Visa •• 8823»."""
+    return f"Пополнение с {BRAND_TITLES.get(brand, 'карты')} •• {last4}"
+
+
+@app.post("/topup")
+def topup(body: TopupIn, user: Unlocked) -> dict:
+    """Учебное пополнение баланса со своей привязанной карты: от 100 до 500 000 ₸, за 24 часа до 1 000 000 ₸.
+    Настоящего списания с карты нет."""
+    card = db.card_of(user["id"], body.card_id)
+    if card is None:
+        raise fail(404, "card_not_found")
+    if body.amount < TOPUP_MIN:
+        raise fail(422, "amount_too_small", min=TOPUP_MIN)
+    if body.amount > TOPUP_MAX:
+        raise fail(422, "limit_exceeded", limit=TOPUP_MAX)
+    if wait := guard.take_all([(_topup_rate, user["id"])]):
+        raise slow_down(wait)
+    try:
+        item, balance = db.topup(user["id"], card, body.amount, TOPUP_DAILY)
+    except db.TransferError as err:
+        _topup_rate.refund(user["id"])
+        raise fail(err.status, err.code, **err.extra) from None
+    return {"balance": balance, "id": item["id"], "amount": item["amount"]}
+
+
+@app.post("/demo/request")
+def demo_request(body: DemoRequestIn, user: Unlocked) -> dict:
+    """«Попросить у Алии»: учебный бот сразу присылает сумму — чтобы проверить приём денег в одиночку.
+    До 20 000 ₸ за раз и не чаще 5 раз в час. Только на учебном стенде (QASYNDA_SEED_DEMO=1)."""
+    aliya = demo.by_phone(demo.ALIYA)
+    if aliya is None:
+        raise fail(404, "not_found")
+    if body.amount < MIN_AMOUNT:
+        raise fail(422, "amount_too_small", min=MIN_AMOUNT)
+    if body.amount > DEMO_REQUEST_MAX:
+        raise fail(422, "limit_exceeded", limit=DEMO_REQUEST_MAX)
+    if wait := guard.take_all([(_demo_request_rate, user["id"])]):
+        raise slow_down(wait)
+    result = bot_pays(aliya, user["id"], body.amount, f"request-{uuid.uuid4().hex}")
+    if result is None:
+        _demo_request_rate.refund(user["id"])
+        raise fail(503, "busy")
+    return {"id": result["id"], "amount": result["amount"], "balance": db.user_by_id(user["id"])["balance"]}
 
 
 @app.post("/ws/ticket")

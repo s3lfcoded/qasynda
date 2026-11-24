@@ -7,6 +7,7 @@ import '../state.dart';
 import '../theme.dart';
 import '../widgets.dart';
 import 'cards.dart';
+import 'security.dart';
 import 'support.dart';
 
 /// Настройки: скрытие сумм, Face ID и устройства, на которых открыт аккаунт.
@@ -141,6 +142,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     onTap: () => _open(const CardsScreen()),
                   ),
                   QRow(
+                    icon: Icons.shield_outlined,
+                    title: s.t('security'),
+                    chevron: true,
+                    onTap: () => _open(const SecurityScreen()),
+                  ),
+                  QRow(
                     icon: Icons.support_agent_rounded,
                     title: s.t('support'),
                     chevron: true,
@@ -153,21 +160,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     chevron: true,
                     onTap: _pickLanguage,
                   ),
-                ]),
-                SectionLabel(s.t('security')),
-                QGroup(children: [
-                  QRow(
-                    title: s.t('hideSensitive'),
-                    subtitle: s.t('hideSensitiveHint'),
-                    trailing: QToggle(value: app.hideSensitive, onChanged: app.setHideSensitive),
-                    onTap: () => app.setHideSensitive(!app.hideSensitive),
-                  ),
-                  if (app.biometricAvailable)
-                    QRow(
-                      title: s.t('bio'),
-                      trailing: QToggle(value: app.biometricEnabled, onChanged: (value) => _setBio(app, value)),
-                      onTap: () => _setBio(app, !app.biometricEnabled),
-                    ),
                 ]),
                 SectionLabel(s.t('devices')),
                 if (devices == null)
@@ -244,8 +236,4 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Future<void> _setBio(AppState app, bool value) async {
-    final ok = await app.setBiometric(value);
-    if (!ok && mounted) showError(context, app.s.t('bioFailed'));
-  }
 }

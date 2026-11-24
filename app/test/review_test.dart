@@ -686,10 +686,76 @@ void main() {
     ]);
   }));
 
+  testWidgets('new number: code says "not registered", then name, new PIN twice and /auth/register', _quiet((tester) async {
+    final srv = await FakeServer.start(tester, {
+      'POST /auth/start': (_, _) => (200, {'next': 'sms', 'challenge': 'r' * 24, 'ttl': 300, 'demo_code': '123456'}),
+      'POST /auth/code': (_, _) => (200, {'ok': true, 'registered': false}),
+      'POST /auth/register': (_, _) => (200, {'token': 'session'}),
+      'POST /ws/ticket': _ticket,
+      'GET /me': _me,
+      'GET /transfers': _history,
+    });
+    FakeStorage().install(tester);
+    _tallScreen(tester);
+    final state = AppState()..ready = true;
+    state.api.baseUrl = srv.url;
+    await tester.pumpWidget(QasyndaApp(state: state));
+    await tester.pump();
+    tester.takeException();
+
+    await tester.enterText(find.byType(TextField), '+77010000002');
+    await tester.pump();
+    await tester.tap(find.text('Продолжить'));
+    await _until(tester, find.byType(CodeCells));
+    await tester.enterText(find.byType(TextField), '123456');
+    await _until(tester, find.text('Как вас зовут?'));
+    expect(find.text('Как вас зовут?'), findsOneWidget);
+    expect(srv.count('POST /auth/confirm'), 0);
+
+    await tester.enterText(find.byType(TextField).at(0), 'Айгерим');
+    await tester.enterText(find.byType(TextField).at(1), 'Касымова');
+    await tester.pump();
+    expect(find.text('Получатели увидят имя и первую букву фамилии: Айгерим К.'), findsOneWidget);
+    await tester.tap(find.text('Продолжить'));
+    await _until(tester, find.text('Придумайте PIN-код'));
+
+    Future<void> type(String pin) async {
+      for (final d in pin.split('')) {
+        await tester.tap(find.text(d));
+        await tester.pump();
+      }
+    }
+
+    // Простой код не уходит на сервер.
+    await type('1111');
+    await _until(tester, find.text('Слишком простой код. Не используйте 1234, 1111 и год рождения'));
+    expect(find.text('Придумайте PIN-код'), findsOneWidget);
+
+    await type('2580');
+    await _until(tester, find.text('Повторите PIN-код'));
+    // Коды не совпали — снова «Придумайте».
+    await type('2581');
+    await _until(tester, find.text('Коды не совпали. Придумайте PIN-код заново'));
+    expect(find.text('Придумайте PIN-код'), findsOneWidget);
+    expect(srv.count('POST /auth/register'), 0);
+
+    await type('2580');
+    await _until(tester, find.text('Повторите PIN-код'));
+    await type('2580');
+    await _until(tester, find.byType(HomeScreen));
+    expect(find.byType(HomeScreen, skipOffstage: false), findsOneWidget);
+    final body = srv.bodies['POST /auth/register']!.single;
+    state.api.token = null;
+    await tester.runAsync(srv.close);
+    await tester.pump(const Duration(minutes: 1));
+    expect(body, {'challenge': 'r' * 24, 'name': 'Айгерим Касымова', 'pin': '2580'});
+  }));
+
   test('every error code the server can return has a message', () {
     const generic = 'Что-то пошло не так';
     final missing = ['idempotency_conflict', 'recipient_not_found', 'device_required', 'pin_or_bio_required',
-      'invalid_code', 'code_required', 'start_over']
+      'invalid_code', 'code_required', 'start_over', 'invalid_name', 'weak_pin', 'already_registered',
+      'topup_limit_exceeded', 'card_not_found']
         .where((c) => const S('ru').error(c) == generic)
         .toList();
     expect(missing, isEmpty);

@@ -22,6 +22,10 @@ class Q {
   static const dangerSoft = Color(0xFFFBEAE8);
   static const onAccent = Color(0xFFFFFFFF);
 
+  /// Учебные боты: синий не путается ни с Bluetooth (бирюзовый), ни с GPS (янтарный).
+  static const botInk = Color(0xFF3F5B8C);
+  static const botSoft = Color(0xFFE8EDF6);
+
   static const font = 'Onest';
 
   /// Поле экрана слева и справа.

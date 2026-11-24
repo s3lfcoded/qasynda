@@ -71,8 +71,9 @@ class CardFront extends StatelessWidget {
   }
 }
 
-/// Оборот виртуальной карты: полный номер с кнопкой копирования, срок и CVV с глазком.
-/// Пока реквизиты не пришли, номер показан точками, а кнопки неактивны.
+/// Оборот виртуальной карты. Открывается закрытым: «•••• •••• •••• 4417», срок «••/••», CVV «•••»,
+/// над номером «Подтвердите, чтобы показать реквизиты», справа белая кнопка «Показать» с Face ID.
+/// После подтверждения номер и срок открываются roll, появляются копирование и глазок CVV.
 class CardBack extends StatelessWidget {
   const CardBack({
     super.key,
@@ -87,6 +88,11 @@ class CardBack extends StatelessWidget {
     required this.copyLabel,
     required this.showCvvLabel,
     required this.hideCvvLabel,
+    this.revealed = true,
+    this.confirmCaption = '',
+    this.revealLabel = '',
+    this.biometricIcon,
+    this.onReveal,
     this.onCopy,
     this.onToggleCvv,
   });
@@ -96,11 +102,16 @@ class CardBack extends StatelessWidget {
   final String last4;
   final String expiryLabel;
 
-  /// Полный номер; null — реквизиты ещё не загружены.
+  /// Полный номер; null — реквизиты закрыты или ещё не загружены.
   final String? number;
   final String? expiry;
   final String? cvv;
   final bool cvvShown;
+  final bool revealed;
+  final String confirmCaption;
+  final String revealLabel;
+  final Widget? biometricIcon;
+  final VoidCallback? onReveal;
   final String copyLabel;
   final String showCvvLabel;
   final String hideCvvLabel;
@@ -120,7 +131,8 @@ class CardBack extends StatelessWidget {
   Widget build(BuildContext context) {
     const value = TextStyle(color: Q.onAccent, fontSize: 16, height: 24 / 16, fontWeight: FontWeight.w600, fontFeatures: Q.tabular);
     const caption = TextStyle(color: _label, fontSize: 12, height: 16 / 12);
-    final shownNumber = number == null ? '•••• •••• •••• $last4' : _group(number!);
+    final open = revealed && number != null;
+    final masked = '•••• •••• •••• $last4';
     Widget roundButton(IconData icon, String tooltip, VoidCallback? onPressed) => SizedBox.square(
           dimension: 44,
           child: IconButton(
@@ -149,48 +161,88 @@ class CardBack extends StatelessWidget {
           ]),
         ),
         const Spacer(),
-        Row(children: [
-          Flexible(
-            child: FittedBox(
-              fit: BoxFit.scaleDown,
-              alignment: Alignment.centerLeft,
-              child: Text(shownNumber,
-                  style: const TextStyle(
-                      color: Q.onAccent, fontSize: 20, height: 28 / 20, fontWeight: FontWeight.w600, letterSpacing: 0.8, fontFeatures: Q.tabular)),
-            ),
-          ),
-          const SizedBox(width: 4),
-          roundButton(Icons.content_copy_rounded, copyLabel, onCopy),
-        ]),
+        AnimatedOpacity(
+          duration: const Duration(milliseconds: 200),
+          opacity: open ? 0 : 1,
+          child: Text(confirmCaption, maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: _soft, fontSize: 13, height: 16 / 13)),
+        ),
         const SizedBox(height: 4),
-        Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(expiryLabel, style: caption),
-            Text(expiry ?? '••/••', style: value),
-          ]),
-          const SizedBox(width: 32),
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('CVV', style: caption),
-            Row(mainAxisSize: MainAxisSize.min, children: [
-              RollingAmount(cvv ?? '•••', style: value, hidden: !cvvShown || cvv == null, mask: '•••'),
+        SizedBox(
+          height: 28,
+          child: Row(children: [
+            Flexible(
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerLeft,
+                child: RollingAmount(
+                  open ? _group(number!) : masked,
+                  hidden: !open,
+                  mask: masked,
+                  style: const TextStyle(
+                      color: Q.onAccent, fontSize: 20, height: 28 / 20, fontWeight: FontWeight.w600, letterSpacing: 0.8, fontFeatures: Q.tabular),
+                ),
+              ),
+            ),
+            if (open) ...[
               const SizedBox(width: 4),
-              SizedBox(
-                width: 44,
-                height: 24,
-                child: OverflowBox(
-                  maxHeight: 44,
-                  child: roundButton(
-                    cvvShown ? Icons.visibility_outlined : Icons.visibility_off_outlined,
-                    cvvShown ? hideCvvLabel : showCvvLabel,
-                    onToggleCvv,
+              SizedBox(width: 44, height: 28, child: OverflowBox(maxHeight: 44, child: roundButton(Icons.content_copy_rounded, copyLabel, onCopy))),
+            ],
+          ]),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          height: 40,
+          child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+            Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(expiryLabel, style: caption),
+              RollingAmount(open ? (expiry ?? '••/••') : '00/00', style: value, hidden: !open, mask: '••/••'),
+            ]),
+            const SizedBox(width: 32),
+            Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('CVV', style: caption),
+              Row(mainAxisSize: MainAxisSize.min, children: [
+                RollingAmount(cvv ?? '000', style: value, hidden: !cvvShown || cvv == null, mask: '•••'),
+                if (open) ...[
+                  const SizedBox(width: 4),
+                  SizedBox(
+                    width: 44,
+                    height: 24,
+                    child: OverflowBox(
+                      maxHeight: 44,
+                      child: roundButton(
+                        cvvShown ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+                        cvvShown ? hideCvvLabel : showCvvLabel,
+                        onToggleCvv,
+                      ),
+                    ),
+                  ),
+                ],
+              ]),
+            ]),
+            const Spacer(),
+            if (open)
+              const Text('KZT', style: TextStyle(color: _soft, fontSize: 14, height: 24 / 14, fontWeight: FontWeight.w600))
+            else
+              Material(
+                color: Colors.white,
+                shape: const StadiumBorder(),
+                clipBehavior: Clip.antiAlias,
+                child: InkWell(
+                  onTap: onReveal,
+                  child: Container(
+                    height: 40,
+                    padding: const EdgeInsets.only(left: 12, right: 16),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      ?biometricIcon,
+                      const SizedBox(width: 8),
+                      Text(revealLabel, style: const TextStyle(color: Q.ink, fontSize: 15, height: 20 / 15, fontWeight: FontWeight.w600)),
+                    ]),
                   ),
                 ),
               ),
-            ]),
           ]),
-          const Spacer(),
-          const Text('KZT', style: TextStyle(color: _soft, fontSize: 14, height: 24 / 14, fontWeight: FontWeight.w600)),
-        ]),
+        ),
       ]),
     );
   }
@@ -237,18 +289,28 @@ class _RingsPainter extends CustomPainter {
 }
 
 /// Карта, которая переворачивается в 3D вокруг вертикальной оси.
-/// * Долгое нажатие 400 мс: при касании карта уменьшается до 0.98, на 400 мс — лёгкая вибрация и
-///   переворот на 180° за 500 мс.
+/// * Нажатие или долгое нажатие (400 мс, с лёгкой вибрацией) — переворот за 640 мс,
+///   Cubic(0.45, 0, 0.2, 1); на ребре карта чуть отдаляется.
 /// * Свайп: угол следует за пальцем; после отпускания карта доворачивается, если угол больше 70° или
 ///   палец быстрый (больше 700 pt/с), иначе возвращается.
+/// * [beforeBack] — подтверждение перед показом оборота (Face ID или код). Пока его нет, свайп с лица
+///   карту не крутит, а только просит подтвердить.
 /// При «уменьшить движение» стороны сменяются кроссфейдом без 3D.
 class FlipCard extends StatefulWidget {
-  const FlipCard({super.key, required this.front, required this.back, this.onSide, this.semanticLabel});
+  const FlipCard({
+    super.key,
+    required this.front,
+    required this.back,
+    this.onSide,
+    this.beforeBack,
+    this.semanticLabel,
+  });
   final Widget front;
   final Widget back;
 
   /// Сторона после поворота: true — оборот.
   final ValueChanged<bool>? onSide;
+  final Future<bool> Function()? beforeBack;
   final String? semanticLabel;
 
   @override
@@ -256,23 +318,44 @@ class FlipCard extends StatefulWidget {
 }
 
 class FlipCardState extends State<FlipCard> with TickerProviderStateMixin {
-  static const _turn = Cubic(0.65, 0, 0.35, 1);
+  /// Мягкий разгон и длинная плавная посадка.
+  static const _turn = Cubic(0.45, 0, 0.2, 1);
+  static const _turnTime = Duration(milliseconds: 640);
 
   late final _anim = AnimationController.unbounded(vsync: this);
   double _base = 0;
   bool _pressed = false;
   bool _dragging = false;
+  bool _gated = false;
+  double _gateDx = 0;
+  bool _asking = false;
   bool _back = false;
 
   bool get _reduced => MediaQuery.maybeDisableAnimationsOf(context) ?? false;
 
-  /// Перевернуть программно (кнопкой для экранного диктора).
-  void flip() => _animateTo(_base + 180, const Duration(milliseconds: 500), _turn);
+  /// Перевернуть (нажатием, долгим нажатием или кнопкой для экранного диктора).
+  Future<void> flip([double direction = 1]) => _turnTo(_base + 180 * direction, _turnTime, _turn);
 
   @override
   void dispose() {
     _anim.dispose();
     super.dispose();
+  }
+
+  /// Поворот на оборот проходит через подтверждение; обратно на лицо — без него.
+  Future<void> _turnTo(double target, Duration duration, Curve curve) async {
+    final toBack = ((target % 360) + 360) % 360 == 180;
+    if (toBack && !_back && widget.beforeBack != null) {
+      if (_asking) return;
+      _asking = true;
+      final ok = await widget.beforeBack!();
+      _asking = false;
+      if (!ok || !mounted) {
+        if (mounted) _animateTo(_base, const Duration(milliseconds: 280), rollCurve);
+        return;
+      }
+    }
+    await _animateTo(target, duration, curve);
   }
 
   void _settle(double target) {
@@ -296,6 +379,11 @@ class FlipCardState extends State<FlipCard> with TickerProviderStateMixin {
     if (mounted) _settle(target);
   }
 
+  void _onTap() {
+    if (_dragging) return;
+    flip();
+  }
+
   void _onLongPress() {
     if (_dragging) return;
     HapticFeedback.lightImpact();
@@ -306,19 +394,32 @@ class FlipCardState extends State<FlipCard> with TickerProviderStateMixin {
   void _onDragStart(DragStartDetails d) {
     _dragging = true;
     _anim.stop();
+    // С лица на оборот без подтверждения карта не крутится: свайп только просит подтвердить.
+    _gated = !_back && widget.beforeBack != null;
+    _gateDx = 0;
     setState(() => _pressed = false);
   }
 
   void _onDragUpdate(DragUpdateDetails d, double width) {
+    if (_gated) {
+      _gateDx += d.delta.dx;
+      return;
+    }
     if (_reduced) return;
     _anim.value = _anim.value + d.delta.dx / width * 180;
   }
 
   void _onDragEnd(DragEndDetails d, double width) {
-    // Отмена жеста без перетаскивания (например, победило долгое нажатие) ничего не меняет.
+    // Отмена жеста без перетаскивания (например, победило нажатие) ничего не меняет.
     if (!_dragging) return;
     _dragging = false;
     final v = d.velocity.pixelsPerSecond.dx;
+    if (_gated) {
+      _gated = false;
+      final dir = (_gateDx != 0 ? _gateDx : v).sign;
+      if (_gateDx.abs() > width * 0.2 || v.abs() > 700) flip(dir == 0 ? 1 : dir);
+      return;
+    }
     if (_reduced) {
       if (v.abs() > 300) flip();
       return;
@@ -328,8 +429,8 @@ class FlipCardState extends State<FlipCard> with TickerProviderStateMixin {
     final go = delta.abs() > 70 || v.abs() > 700;
     final target = go ? _base + 180 * (dir == 0 ? 1 : dir) : _base;
     final left = (target - _anim.value).abs();
-    final ms = go ? (160 + 200 * (left / 180)).round() : 280;
-    _animateTo(target, Duration(milliseconds: ms), rollCurve);
+    final ms = go ? (200 + 280 * (left / 180)).round() : 320;
+    _turnTo(target, Duration(milliseconds: ms), rollCurve);
   }
 
   @override
@@ -342,6 +443,10 @@ class FlipCardState extends State<FlipCard> with TickerProviderStateMixin {
         onTap: flip,
         child: RawGestureDetector(
           gestures: {
+            TapGestureRecognizer: GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
+              () => TapGestureRecognizer(),
+              (r) => r.onTap = _onTap,
+            ),
             LongPressGestureRecognizer: GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
               () => LongPressGestureRecognizer(duration: const Duration(milliseconds: 400)),
               (r) => r
@@ -380,9 +485,12 @@ class FlipCardState extends State<FlipCard> with TickerProviderStateMixin {
       builder: (context, _) {
         final a = ((_anim.value % 360) + 360) % 360;
         final showBack = a > 90 && a < 270;
+        // На ребре карта чуть отдаляется: масштаб 1 → 0.96 → 1 по синусу угла.
+        final depth = 1 - 0.04 * math.sin(a * math.pi / 180).abs();
         final m = Matrix4.identity()
           ..setEntry(3, 2, 0.0012)
-          ..rotateY(a * math.pi / 180);
+          ..rotateY(a * math.pi / 180)
+          ..scaleByDouble(depth, depth, 1, 1);
         return Transform(
           alignment: Alignment.center,
           transform: m,
