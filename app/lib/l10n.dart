@@ -4,6 +4,7 @@ const _ru = <String, String>{
   'phone': 'Номер телефона',
   'pin': 'PIN-код',
   'login': 'Войти',
+  'next': 'Далее',
   'server': 'Адрес сервера',
   'save': 'Сохранить',
   'hello': 'Здравствуйте, {name}',
@@ -42,16 +43,17 @@ const _ru = <String, String>{
   'needNearby': 'Включите Bluetooth или геолокацию и разрешите доступ',
   'bioReason': 'Подтвердите вход в Qasynda',
   'lockTitle': 'Введите код',
-  'lockHint': 'PIN-код от входа',
-  'unlock': 'Войти',
   'useBio': 'Face ID или отпечаток',
   'forgot': 'Выйти из аккаунта',
   'smsTitle': 'Подтвердите новый телефон',
   'smsHint': 'Мы отправили код на {phone}. Вход с нового устройства всегда подтверждается SMS.',
   'smsCode': 'Код из SMS',
-  'smsWrong': 'Неверный код из SMS или PIN-код',
+  'paste': 'Вставить код',
+  'pinTitle': 'Введите PIN-код',
+  'pinHint': 'Вход в аккаунт {phone}',
+  'pinWrong': 'Неверный PIN-код',
+  'pinDelete': 'Удалить',
   'demoSms': 'Учебное SMS: {code}',
-  'confirm': 'Подтвердить',
   'back': 'Назад',
   'settings': 'Настройки',
   'security': 'Безопасность',
@@ -69,6 +71,9 @@ const _ru = <String, String>{
   'newDevice': 'Вход в аккаунт с нового устройства: {name}. Если это не вы — выйдите на нём в настройках',
   'err.too_many_sms': 'Слишком много SMS. Попробуйте через {wait}',
   'err.challenge_expired': 'Код устарел. Войдите заново',
+  'err.invalid_code': 'Неверный код. Осталось попыток: {n}',
+  'err.code_required': 'Сначала введите код из SMS',
+  'err.start_over': 'Начните вход заново',
   'err.invalid_pin': 'Неверный код',
   'err.idempotency_conflict': 'Прошлый перевод с этого экрана уже прошёл — проверьте историю',
   'err.recipient_not_found': 'Получатель не найден',
@@ -106,6 +111,7 @@ const _kk = <String, String>{
   'phone': 'Телефон нөмірі',
   'pin': 'PIN-код',
   'login': 'Кіру',
+  'next': 'Әрі қарай',
   'server': 'Сервер мекенжайы',
   'save': 'Сақтау',
   'hello': 'Сәлеметсіз бе, {name}',
@@ -144,16 +150,17 @@ const _kk = <String, String>{
   'needNearby': 'Bluetooth немесе геолокацияны қосып, рұқсат беріңіз',
   'bioReason': 'Qasynda-ға кіруді растаңыз',
   'lockTitle': 'Кодты енгізіңіз',
-  'lockHint': 'Кіру PIN-коды',
-  'unlock': 'Кіру',
   'useBio': 'Face ID немесе саусақ ізі',
   'forgot': 'Аккаунттан шығу',
   'smsTitle': 'Жаңа телефонды растаңыз',
   'smsHint': '{phone} нөміріне код жібердік. Жаңа құрылғыдан кіру әрқашан SMS арқылы расталады.',
   'smsCode': 'SMS коды',
-  'smsWrong': 'SMS коды немесе PIN-код қате',
+  'paste': 'Кодты қою',
+  'pinTitle': 'PIN-кодты енгізіңіз',
+  'pinHint': '{phone} аккаунтына кіру',
+  'pinWrong': 'PIN-код қате',
+  'pinDelete': 'Өшіру',
   'demoSms': 'Оқу SMS-і: {code}',
-  'confirm': 'Растау',
   'back': 'Артқа',
   'settings': 'Баптаулар',
   'security': 'Қауіпсіздік',
@@ -171,6 +178,9 @@ const _kk = <String, String>{
   'newDevice': 'Аккаунтқа жаңа құрылғыдан кірді: {name}. Бұл сіз болмасаңыз — баптауларда одан шығыңыз',
   'err.too_many_sms': 'SMS тым көп. {wait} кейін қайталаңыз',
   'err.challenge_expired': 'Код ескірді. Қайта кіріңіз',
+  'err.invalid_code': 'Код қате. Қалған әрекет саны: {n}',
+  'err.code_required': 'Алдымен SMS кодын енгізіңіз',
+  'err.start_over': 'Кіруді басынан бастаңыз',
   'err.invalid_pin': 'Код қате',
   'err.idempotency_conflict': 'Осы экраннан бұрынғы аударым өтіп кетті — тарихты тексеріңіз',
   'err.recipient_not_found': 'Алушы табылмады',
@@ -213,7 +223,7 @@ class S {
     return text;
   }
 
-  /// Текст ошибки сервера. detail — поля из ответа: retry_after, left, min.
+  /// Текст ошибки сервера. detail — поля из ответа: retry_after, left, min, attempts_left.
   String error(String code, [Map<String, dynamic> detail = const {}]) {
     final key = 'err.$code';
     if (!_ru.containsKey(key)) return t('err.unknown');
@@ -222,6 +232,8 @@ class S {
     if (wait is int) {
       args['wait'] = wait < 3600 ? '${(wait / 60).ceil()} ${t('unit.min')}' : '${(wait / 3600).ceil()} ${t('unit.h')}';
     }
+    final attempts = detail['attempts_left'];
+    if (attempts is int) args['n'] = '$attempts';
     final sum = detail['left'] ?? detail['min'];
     if (sum is int) args['sum'] = money(sum);
     return t(key, args);

@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app import db, guard, main, nearby
-from test_api import AIGERIM, DANIYAR, MERCHANT, auth, bt_body, client, confirm, device, login, ws_url  # noqa: F401
+from test_api import (AIGERIM, DANIYAR, MERCHANT, auth, bt_body, client, code, confirm, device, login,  # noqa: F401
+                      start, wrong_code, ws_url)
 
 
 # --- unlock window ---
@@ -99,14 +100,15 @@ def test_stranger_cannot_lock_owner_out_of_new_phone_login(client, monkeypatch):
     shift = [0.0]
     monkeypatch.setattr(guard, "clock", lambda: real() + shift[0])
     for i in range(3):
-        pending = login(client, AIGERIM, pin="0000", secret=f"stranger-phone-{i:026d}").json()
-        wrong = "000000" if pending["demo_code"] != "000000" else "111111"
+        pending = start(client, AIGERIM, secret=f"stranger-phone-{i:026d}").json()
         for _ in range(main.SMS_ATTEMPTS):
-            confirm(client, pending, "0000", wrong)
+            code(client, pending, wrong_code(pending))
+            confirm(client, pending, "0000")
         shift[0] += 301
     shift[0] += 3600
-    pending = login(client, AIGERIM, secret=device(AIGERIM, 5)).json()
-    assert pending.get("sms_required"), pending
+    pending = start(client, AIGERIM, secret=device(AIGERIM, 5)).json()
+    assert pending["next"] == "sms", pending
+    assert code(client, pending).status_code == 200
     r = confirm(client, pending, AIGERIM["pin"])
     assert r.status_code == 200, f"owner with the right SMS code and PIN: {r.status_code} {r.json()}"
 
@@ -138,10 +140,13 @@ def test_failures_on_bound_phone_do_not_change_new_phone_reply(client):
     auth(client, DANIYAR)
     for _ in range(main.LOGIN_ATTEMPTS):
         login(client, DANIYAR, pin="9999")
-    r = login(client, DANIYAR, secret=device(DANIYAR, 3))
-    nobody = client.post("/auth/login", json={"phone": "+77000000099", "pin": "1111",
-                                              "device_secret": device(DANIYAR, 4)})
+    r = start(client, DANIYAR, secret=device(DANIYAR, 3))
+    nobody = start(client, DANIYAR, secret=device(DANIYAR, 4), phone="+77000000099")
     assert r.status_code == nobody.status_code == 200, (r.status_code, r.json(), nobody.status_code)
+    assert set(r.json()) == set(nobody.json()) and r.json()["next"] == nobody.json()["next"] == "sms"
+    assert code(client, r.json()).status_code == code(client, nobody.json()).status_code == 200
+    a, b = confirm(client, r.json(), "9999"), confirm(client, nobody.json(), "9999")
+    assert (a.status_code, a.json()) == (b.status_code, b.json()) == (401, {"detail": {"code": "invalid_credentials"}})
 
 
 def test_flood_of_other_numbers_does_not_reset_pin_limit(client, monkeypatch):
@@ -153,7 +158,9 @@ def test_flood_of_other_numbers_does_not_reset_pin_limit(client, monkeypatch):
         assert login(client, DANIYAR, pin="9999").status_code == 401
     assert login(client, DANIYAR, pin="9999").status_code == 429
     for i in range(50):
-        client.post("/auth/login", json={"phone": f"+7700{i:07d}", "pin": "1111", "device_secret": device(AIGERIM, i)})
+        pending = start(client, AIGERIM, secret=device(AIGERIM, i), phone=f"+7700{i:07d}").json()
+        code(client, pending)
+        confirm(client, pending, "1111")
     r = login(client, DANIYAR, pin="9999")
     assert r.status_code == 429, f"PIN guessing reopened by a flood of unrelated numbers: {r.status_code}"
 

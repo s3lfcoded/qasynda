@@ -1,10 +1,11 @@
-import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform;
 import 'package:material_ui/material_ui.dart';
 
 import '../api.dart';
 import '../state.dart';
 import '../theme.dart';
 import '../widgets.dart';
+import '../widgets/pin_pad.dart';
 
 /// Экран блокировки: при запуске и после минуты в фоне. Face ID или отпечаток, иначе PIN-код,
 /// который проверяет сервер — подобрать его на украденном телефоне нельзя.
@@ -16,8 +17,6 @@ class LockScreen extends StatefulWidget {
 }
 
 class _LockScreenState extends State<LockScreen> {
-  final _pin = TextEditingController();
-  bool _busy = false;
   bool _asked = false;
 
   @override
@@ -29,14 +28,6 @@ class _LockScreenState extends State<LockScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _biometrics());
   }
 
-  @override
-  void dispose() {
-    _pin.dispose();
-    super.dispose();
-  }
-
-  bool get _valid => RegExp(r'^\d{4,6}$').hasMatch(_pin.text);
-
   Future<void> _biometrics() async {
     final app = AppScope.of(context);
     try {
@@ -46,16 +37,14 @@ class _LockScreenState extends State<LockScreen> {
     }
   }
 
-  Future<void> _submit() async {
+  Future<bool> _submit(String pin) async {
     final app = AppScope.of(context);
-    setState(() => _busy = true);
     try {
-      await app.unlock(_pin.text);
+      await app.unlock(pin);
+      return true;
     } on ApiError catch (e) {
-      _pin.clear();
       if (mounted) showError(context, app.s.error(e.code, e.detail));
-    } finally {
-      if (mounted) setState(() => _busy = false);
+      return false;
     }
   }
 
@@ -64,11 +53,11 @@ class _LockScreenState extends State<LockScreen> {
     final app = AppScope.of(context);
     final s = app.s;
     final name = '${app.profile?['name'] ?? ''}'.split(' ').first;
+    final ios = defaultTargetPlatform == TargetPlatform.iOS;
     return Scaffold(
       body: SafeArea(
         child: ListView(
-          keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-          padding: const EdgeInsets.fromLTRB(24, 72, 24, 24),
+          padding: const EdgeInsets.fromLTRB(24, 48, 24, 24),
           children: [
             Align(alignment: Alignment.centerLeft, child: Avatar(name: name, size: 64)),
             const SizedBox(height: 20),
@@ -77,35 +66,25 @@ class _LockScreenState extends State<LockScreen> {
             const SizedBox(height: 8),
             Text(s.t('lockTitle'), style: const TextStyle(fontSize: 17, color: Q.muted)),
             const SizedBox(height: 32),
-            TextField(
-              controller: _pin,
-              autofocus: !app.biometricReady,
-              keyboardType: TextInputType.number,
-              obscureText: true,
-              enableSuggestions: false,
-              autocorrect: false,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(6)],
-              decoration: InputDecoration(labelText: s.t('lockHint')),
-              onChanged: (_) => setState(() {}),
-              onSubmitted: (_) => _valid && !_busy ? _submit() : null,
-            ),
-            const SizedBox(height: 20),
-            FilledButton(
-              onPressed: _valid && !_busy ? _submit : null,
-              child: _busy
-                  ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5, color: Q.onAccent))
-                  : Text(s.t('unlock')),
-            ),
-            if (app.biometricReady) ...[
-              const SizedBox(height: 12),
-              OutlinedButton.icon(
-                onPressed: _busy ? null : _biometrics,
-                icon: const Icon(Icons.fingerprint_rounded),
-                label: Text(s.t('useBio')),
+            Center(
+              child: PinPad(
+                onSubmit: _submit,
+                deleteLabel: s.t('pinDelete'),
+                leading: app.biometricReady
+                    ? IconButton(
+                        onPressed: _biometrics,
+                        tooltip: s.t('useBio'),
+                        iconSize: 32,
+                        color: Q.text,
+                        icon: Icon(ios ? Icons.face_rounded : Icons.fingerprint_rounded),
+                      )
+                    : null,
               ),
-            ],
-            const SizedBox(height: 24),
-            TextButton(onPressed: app.logout, child: Text(s.t('forgot'), style: const TextStyle(color: Q.muted))),
+            ),
+            const SizedBox(height: 16),
+            Center(
+              child: TextButton(onPressed: app.logout, child: Text(s.t('forgot'), style: const TextStyle(color: Q.muted))),
+            ),
           ],
         ),
       ),

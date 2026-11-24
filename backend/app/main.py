@@ -73,16 +73,29 @@ class Location(BaseModel):
     mocked: bool = False
 
 
-class LoginIn(BaseModel):
-    phone: str = Field(pattern=r"^\+7[0-9]{10}$")
-    pin: Pin
+Phone = Annotated[str, Field(pattern=r"^\+7[0-9]{10}$")]
+Challenge = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{16,64}$")]
+
+
+class StartIn(BaseModel):
+    phone: Phone
     device_secret: DeviceSecret
     device_name: str = Field(default="Телефон", min_length=1, max_length=60)
 
 
-class ConfirmIn(BaseModel):
-    challenge: str = Field(pattern=r"^[A-Za-z0-9_-]{16,64}$")
+class CodeIn(BaseModel):
+    challenge: Challenge
     code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class LoginIn(BaseModel):
+    phone: Phone
+    pin: Pin
+    device_secret: DeviceSecret
+
+
+class ConfirmIn(BaseModel):
+    challenge: Challenge
     pin: Pin
 
 
@@ -425,21 +438,16 @@ def health() -> dict:
     return {"ok": True}
 
 
-@app.post("/auth/login")
-def login(body: LoginIn, request: Request) -> dict:
-    """Вход. С привязанного телефона — по PIN. С нового телефона PIN даже не проверяется, пока не введён
-    код из SMS: иначе перебор PIN с чужого устройства продолжал бы работать, а ответ «нужно SMS»
-    подсказывал бы, что PIN угадан. Ответ для несуществующего номера такой же, как для настоящего,
-    и не зависит от того, подбирает ли кто-то PIN владельца на его телефоне."""
+@app.post("/auth/start")
+def start(body: StartIn, request: Request) -> dict:
+    """Первый шаг входа — только номер. С телефона, уже привязанного к этому номеру, дальше PIN.
+    С любого другого — SMS, и PIN не проверяется, пока не введён код: иначе перебор PIN с чужого
+    устройства продолжал бы работать. Для несуществующего номера ответ такой же, как для настоящего,
+    с теми же лимитами, только SMS никуда не уходит."""
     ip = client_ip(request)
     user = db.user_by_phone(body.phone)
-    device = db.device_of(user["id"], body.device_secret) if user else None
-    if device:
-        gates = pin_gate(body.phone, ip)
-        if not db.check_pin(user, body.pin):
-            raise fail(401, "invalid_credentials")
-        pin_passed(body.phone, gates)
-        return signed_in(user["id"], device["id"])
+    if user and db.device_of(user["id"], body.device_secret):
+        return {"next": "pin"}
 
     sms_gates: list[tuple[guard.Window, object]] = [(_sms_phone, body.phone)]
     if ip:
@@ -449,38 +457,72 @@ def login(body: LoginIn, request: Request) -> dict:
     code = f"{secrets.randbelow(10**6):06d}"
     challenge = _challenges.put({
         "phone": body.phone, "user_id": user["id"] if user else None, "code": _sha(code),
-        "device_secret": body.device_secret, "device_name": body.device_name, "attempts": 0,
+        "device_secret": body.device_secret, "device_name": body.device_name, "attempts": 0, "verified": False,
     })
     if challenge is None:
         raise wait_error("too_many_sms", 60)
     if user:
         sms.send(body.phone, f"Qasynda: код входа с нового телефона {code}. Никому его не сообщайте.")
-    reply = {"sms_required": True, "challenge": challenge, "ttl": SMS_TTL}
+    reply = {"next": "sms", "challenge": challenge, "ttl": SMS_TTL}
     if sms.demo():
         reply["demo_code"] = code
     return reply
 
 
-@app.post("/auth/confirm")
-def confirm(body: ConfirmIn, request: Request) -> dict:
-    """Второй шаг входа с нового телефона: код из SMS и PIN. Ошибка одна на оба поля, чтобы по ответу
-    нельзя было понять, что из них неверно. Неверный код тратит только попытки этого SMS (5),
-    а счётчики PIN владельца трогает лишь тот, кто ввёл верный код."""
+@app.post("/auth/code")
+def sms_code(body: CodeIn) -> dict:
+    """Код из SMS. Попытка засчитывается до сравнения и под блокировкой, поэтому параллельные запросы
+    не дают больше пяти попыток на одно SMS; после пятой ошибки запрос закрывается. Верный код только
+    открывает шаг PIN — счётчики PIN владельца он не трогает. Для несуществующего номера код
+    принимается так же, а отказ приходит уже на шаге PIN, как при неверном PIN."""
     pending = _challenges.get(body.challenge)
     if pending is None:
         raise fail(401, "challenge_expired")
-    user = db.user_by_id(pending["user_id"]) if pending["user_id"] else None
-    code_ok = hmac.compare_digest(_sha(body.code), pending["code"])
-    if not code_ok or not user:
-        db.check_pin(user, body.pin)  # одинаковое время ответа при любом исходе
-        with _challenges.lock:
-            pending["attempts"] += 1
-            exhausted = pending["attempts"] >= SMS_ATTEMPTS
-        if exhausted:
-            _challenges.pop(body.challenge)
+    with _challenges.lock:
+        if pending["verified"]:
+            return {"next": "pin"}
+        if pending["attempts"] >= SMS_ATTEMPTS:
             raise fail(401, "challenge_expired")
-        raise fail(401, "invalid_credentials")
+        pending["attempts"] += 1
+        if hmac.compare_digest(_sha(body.code), pending["code"]):
+            pending["verified"] = True
+            return {"next": "pin"}
+        left = SMS_ATTEMPTS - pending["attempts"]
+    if left <= 0:
+        _challenges.pop(body.challenge)
+        raise fail(401, "challenge_expired")
+    raise fail(401, "invalid_code", attempts_left=left)
 
+
+@app.post("/auth/login")
+def login(body: LoginIn, request: Request) -> dict:
+    """Вход по PIN с привязанного телефона. С непривязанного PIN не проверяется вовсе и попытки
+    владельца не тратятся; ответ один и тот же для любого номера, существующего или нет."""
+    user = db.user_by_phone(body.phone)
+    device = db.device_of(user["id"], body.device_secret) if user else None
+    if not device:
+        raise fail(401, "start_over")
+    gates = pin_gate(body.phone, client_ip(request))
+    if not db.check_pin(user, body.pin):
+        raise fail(401, "invalid_credentials")
+    pin_passed(body.phone, gates)
+    return signed_in(user["id"], device["id"])
+
+
+@app.post("/auth/confirm")
+def confirm(body: ConfirmIn, request: Request) -> dict:
+    """PIN с нового телефона — только после верного кода из SMS. Неверный PIN не закрывает запрос:
+    повторить можно, пока не кончатся попытки PIN по номеру. Для несуществующего номера ответ такой же,
+    как при неверном PIN, с теми же лимитами."""
+    pending = _challenges.get(body.challenge)
+    if pending is None:
+        raise fail(401, "challenge_expired")
+    with _challenges.lock:
+        verified = pending["verified"]
+    if not verified:
+        raise fail(401, "code_required")
+
+    user = db.user_by_id(pending["user_id"]) if pending["user_id"] else None
     key = ("new_device", pending["phone"])
     gates = pin_gate(key, client_ip(request))
     if not db.check_pin(user, body.pin):

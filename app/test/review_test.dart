@@ -14,6 +14,8 @@ import 'package:qasynda/screens/lock.dart';
 import 'package:qasynda/screens/login.dart';
 import 'package:qasynda/screens/send.dart';
 import 'package:qasynda/state.dart';
+import 'package:qasynda/widgets/code_cells.dart';
+import 'package:qasynda/widgets/pin_pad.dart';
 
 const _storageChannel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
 const _geoChannel = MethodChannel('flutter.baseflow.com/geolocator');
@@ -152,6 +154,14 @@ Future<void> Function(WidgetTester) _quiet(Future<void> Function(WidgetTester) b
         FlutterError.onError = prev;
       }
     };
+
+/// Ждёт, пока на экране не появится [finder]: запросы к настоящему сокету идут в реальном времени.
+Future<void> _until(WidgetTester tester, Finder finder) async {
+  for (var i = 0; i < 50 && finder.evaluate().isEmpty; i++) {
+    await _real(tester, 60);
+    await tester.pump();
+  }
+}
 
 (int, Object?) _ok(HttpRequest _, Map<String, dynamic> _) => (200, {'ok': true});
 (int, Object?) _me(HttpRequest _, Map<String, dynamic> _) => (200, _profile());
@@ -476,8 +486,9 @@ void main() {
     await tester.pump();
     tester.takeException();
     expect(find.byType(LockScreen), findsOneWidget);
+    expect(find.byType(PinPad), findsOneWidget);
     // Кнопка, которая ничего не делает, хуже её отсутствия: пока биометрия не привязана, её нет.
-    expect(find.text('Face ID или отпечаток'), findsNothing);
+    expect(find.byTooltip('Face ID или отпечаток'), findsNothing);
     await tester.runAsync(srv.close);
   }));
 
@@ -538,9 +549,147 @@ void main() {
     expect(generic, isFalse);
   }));
 
+  testWidgets('new phone: number, then SMS code cells, then PIN pad; PIN is sent only after the right code', _quiet((tester) async {
+    final srv = await FakeServer.start(tester, {
+      'POST /auth/start': (_, _) => (200, {'next': 'sms', 'challenge': 'c' * 24, 'ttl': 300, 'demo_code': '123456'}),
+      'POST /auth/code': (_, body) => body['code'] == '123456'
+          ? (200, {'next': 'pin'})
+          : (401, {'detail': {'code': 'invalid_code', 'attempts_left': 4}}),
+      'POST /auth/confirm': (_, body) =>
+          body['pin'] == '1111' ? (200, {'token': 'session'}) : (401, {'detail': {'code': 'invalid_credentials'}}),
+      'POST /ws/ticket': _ticket,
+      'GET /me': _me,
+      'GET /transfers': _history,
+    });
+    FakeStorage().install(tester);
+    _tallScreen(tester);
+    final state = AppState()..ready = true;
+    state.api.baseUrl = srv.url;
+    await tester.pumpWidget(QasyndaApp(state: state));
+    await tester.pump();
+    tester.takeException();
+
+    await tester.enterText(find.byType(TextField), '+77010000001');
+    await tester.pump();
+    await tester.tap(find.text('Далее'));
+    await _until(tester, find.byType(CodeCells));
+    expect(find.byType(CodeCells), findsOneWidget);
+    expect(find.text('Учебное SMS: 123456'), findsOneWidget);
+
+    await tester.enterText(find.byType(TextField), '000000');
+    await _until(tester, find.text('Неверный код. Осталось попыток: 4'));
+    expect(find.text('Неверный код. Осталось попыток: 4'), findsOneWidget);
+    expect(find.byType(CodeCells), findsOneWidget);
+    expect(srv.count('POST /auth/confirm'), 0);
+
+    await tester.enterText(find.byType(TextField), '123456');
+    await _until(tester, find.byType(PinPad));
+    expect(find.byType(PinPad), findsOneWidget);
+
+    for (final pin in ['9999', '1111']) {
+      for (final d in pin.split('')) {
+        await tester.tap(find.text(d));
+        await tester.pump();
+      }
+      await _until(tester, pin == '9999' ? find.text('Неверный PIN-код') : find.byType(HomeScreen));
+      if (pin == '9999') expect(find.text('Неверный PIN-код'), findsOneWidget);
+    }
+    expect(find.byType(HomeScreen), findsOneWidget);
+    final confirms = srv.bodies['POST /auth/confirm']!;
+    final start = srv.bodies['POST /auth/start']!.single;
+    final log = List.of(srv.log);
+    state.api.token = null;
+    await tester.runAsync(srv.close);
+    await tester.pump(const Duration(minutes: 1));
+    expect(start['phone'], '+77010000001');
+    expect(start.containsKey('pin'), isFalse);
+    expect(confirms, [
+      {'challenge': 'c' * 24, 'pin': '9999'},
+      {'challenge': 'c' * 24, 'pin': '1111'},
+    ]);
+    expect(log.indexOf('POST /auth/confirm'), greaterThan(log.lastIndexOf('POST /auth/code')));
+    expect(log, isNot(contains('POST /auth/login')));
+  }));
+
+  testWidgets('bound phone: number, then straight to the PIN pad and /auth/login', _quiet((tester) async {
+    final srv = await FakeServer.start(tester, {
+      'POST /auth/start': (_, _) => (200, {'next': 'pin'}),
+      'POST /auth/login': (_, _) => (200, {'token': 'session'}),
+      'POST /ws/ticket': _ticket,
+      'GET /me': _me,
+      'GET /transfers': _history,
+    });
+    FakeStorage().install(tester);
+    _tallScreen(tester);
+    final state = AppState()..ready = true;
+    state.api.baseUrl = srv.url;
+    await tester.pumpWidget(QasyndaApp(state: state));
+    await tester.pump();
+    tester.takeException();
+
+    await tester.enterText(find.byType(TextField), '+77010000001');
+    await tester.pump();
+    await tester.tap(find.text('Далее'));
+    await _until(tester, find.byType(PinPad));
+    expect(find.byType(CodeCells), findsNothing);
+    for (final d in '1111'.split('')) {
+      await tester.tap(find.text(d));
+      await tester.pump();
+    }
+    await _until(tester, find.byType(HomeScreen));
+    expect(find.byType(HomeScreen), findsOneWidget);
+    final login = srv.bodies['POST /auth/login']!.single;
+    final start = srv.bodies['POST /auth/start']!.single;
+    state.api.token = null;
+    await tester.runAsync(srv.close);
+    await tester.pump(const Duration(minutes: 1));
+    expect(login['phone'], '+77010000001');
+    expect(login['pin'], '1111');
+    expect(login['device_secret'], start['device_secret']);
+    expect(srv.count('POST /auth/code'), 0);
+  }));
+
+  testWidgets('lock screen: PIN pad unlocks; after a wrong PIN it shows the error and takes a new PIN', _quiet((tester) async {
+    final srv = await FakeServer.start(tester, {
+      'POST /auth/unlock': (_, body) => body['pin'] == '1111' ? (200, {'ok': true}) : (403, {'detail': {'code': 'invalid_pin'}}),
+      'POST /ws/ticket': _ticket,
+      'GET /me': _me,
+      'GET /transfers': _history,
+    });
+    FakeStorage().install(tester);
+    _tallScreen(tester);
+    final state = _unlockedState(srv)..locked = true;
+    await tester.pumpWidget(QasyndaApp(state: state));
+    await tester.pump();
+    tester.takeException();
+    expect(find.byType(LockScreen), findsOneWidget);
+
+    for (final pin in ['2222', '1111']) {
+      for (final d in pin.split('')) {
+        await tester.tap(find.text(d));
+        await tester.pump();
+      }
+      await _until(tester, pin == '2222' ? find.text('Неверный код') : find.byType(HomeScreen));
+      if (pin == '2222') {
+        expect(find.text('Неверный код'), findsOneWidget);
+        expect(find.byType(LockScreen), findsOneWidget);
+      }
+    }
+    expect(find.byType(HomeScreen), findsOneWidget);
+    final unlocks = srv.bodies['POST /auth/unlock']!;
+    state.api.token = null;
+    await tester.runAsync(srv.close);
+    await tester.pump(const Duration(minutes: 1));
+    expect(unlocks, [
+      {'pin': '2222'},
+      {'pin': '1111'},
+    ]);
+  }));
+
   test('every error code the server can return has a message', () {
     const generic = 'Что-то пошло не так';
-    final missing = ['idempotency_conflict', 'recipient_not_found', 'device_required', 'pin_or_bio_required']
+    final missing = ['idempotency_conflict', 'recipient_not_found', 'device_required', 'pin_or_bio_required',
+      'invalid_code', 'code_required', 'start_over']
         .where((c) => const S('ru').error(c) == generic)
         .toList();
     expect(missing, isEmpty);

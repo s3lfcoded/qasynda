@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform;
 
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -103,7 +103,7 @@ class Scanner {
       };
       final state = await FlutterBluePlus.adapterState
           .firstWhere(settled.contains)
-          .timeout(Duration(seconds: Platform.isIOS ? 30 : 3));
+          .timeout(Duration(seconds: defaultTargetPlatform == TargetPlatform.iOS ? 30 : 3));
       if (state != BluetoothAdapterState.on) return false;
       _sub = FlutterBluePlus.onScanResults.listen((results) {
         for (final result in results) {

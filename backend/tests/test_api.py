@@ -1,3 +1,4 @@
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -33,22 +34,42 @@ def device(user, n=0):
     return f"test-device-{user['phone'][1:]}-{n:010d}"
 
 
+def start(client, user, secret=None, phone=None, **kw):
+    return client.post("/auth/start", json={"phone": phone or user["phone"], "device_secret": secret or device(user),
+                                            "device_name": "Тест"}, **kw)
+
+
+def code(client, pending, value=None):
+    return client.post("/auth/code", json={"challenge": pending["challenge"], "code": value or pending["demo_code"]})
+
+
+def confirm(client, pending, pin):
+    return client.post("/auth/confirm", json={"challenge": pending["challenge"], "pin": pin})
+
+
 def login(client, user, pin=None, secret=None, **kw):
+    """PIN с привязанного телефона."""
     return client.post("/auth/login", json={"phone": user["phone"], "pin": pin or user["pin"],
-                                            "device_secret": secret or device(user), "device_name": "Тест"}, **kw)
+                                            "device_secret": secret or device(user)}, **kw)
+
+
+def wrong_code(pending):
+    return "000000" if pending["demo_code"] != "000000" else "111111"
 
 
 def auth(client, user, secret=None):
-    """Вход: с нового устройства — через учебное SMS, с привязанного — сразу."""
-    r = login(client, user, secret=secret)
+    """Вход: номер, с нового устройства — учебный код из SMS, затем PIN."""
+    r = start(client, user, secret=secret)
     assert r.status_code == 200, r.text
-    data = r.json()
-    if data.get("sms_required"):
-        r = client.post("/auth/confirm", json={"challenge": data["challenge"], "code": data["demo_code"],
-                                               "pin": user["pin"]})
+    pending = r.json()
+    if pending["next"] == "sms":
+        r = code(client, pending)
         assert r.status_code == 200, r.text
-        data = r.json()
-    return {"Authorization": f"Bearer {data['token']}"}
+        r = confirm(client, pending, user["pin"])
+    else:
+        r = login(client, user, secret=secret)
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['token']}"}
 
 
 def key():
@@ -303,71 +324,138 @@ def test_successful_login_clears_short_window(client):
 
 # --- привязка устройства и SMS ---
 
-def confirm(client, pending, pin, code=None):
-    return client.post("/auth/confirm", json={"challenge": pending["challenge"],
-                                              "code": code or pending["demo_code"], "pin": pin})
-
-
-def test_new_device_needs_sms_and_pin_is_not_checked_before_it(client, monkeypatch):
+def test_start_sends_bound_phone_to_pin_and_new_phone_to_sms(client, monkeypatch):
     sent = []
     monkeypatch.setattr(main.sms, "send", lambda phone, text: sent.append(phone))
-    right = login(client, AIGERIM).json()
-    wrong = login(client, AIGERIM, pin="9999", secret=device(AIGERIM, 1)).json()
-    nobody = client.post("/auth/login", json={"phone": "+77000000000", "pin": "1111",
-                                              "device_secret": device(AIGERIM, 2)}).json()
-    # Верный PIN, неверный PIN и несуществующий номер выглядят одинаково: по ответу ничего не понять.
-    for reply in (right, wrong, nobody):
-        assert set(reply) == {"sms_required", "challenge", "ttl", "demo_code"}
-    assert sent == [AIGERIM["phone"], AIGERIM["phone"]]
+    auth(client, AIGERIM)
+    sent.clear()
+    assert start(client, AIGERIM).json() == {"next": "pin"}
+    new = start(client, AIGERIM, secret=device(AIGERIM, 1)).json()
+    nobody = start(client, AIGERIM, secret=device(AIGERIM, 2), phone="+77000000000").json()
+    # Телефон, привязанный к другому аккаунту, для этого номера тоже новый.
+    other = start(client, DANIYAR, secret=device(AIGERIM)).json()
+    # Настоящий и несуществующий номер выглядят одинаково: по ответу ничего не понять.
+    for reply in (new, nobody, other):
+        assert set(reply) == {"next", "challenge", "ttl", "demo_code"} and reply["next"] == "sms"
+    assert sent == [AIGERIM["phone"], DANIYAR["phone"]]
 
-    r = confirm(client, nobody, "1111")
-    assert r.status_code == 401 and r.json()["detail"]["code"] == "invalid_credentials"
-    r = confirm(client, right, "9999")
-    assert r.status_code == 401 and r.json()["detail"]["code"] == "invalid_credentials"
-    r = confirm(client, right, AIGERIM["pin"])
-    assert r.status_code == 200 and "token" in r.json()
-    # тем же кодом второй раз не войти, а с привязанного телефона SMS больше не нужно
-    r = confirm(client, right, AIGERIM["pin"])
-    assert r.status_code == 401 and r.json()["detail"]["code"] == "challenge_expired"
+
+def test_new_device_pin_is_not_checked_before_the_code(client):
+    auth(client, AIGERIM)
+    pending = start(client, AIGERIM, secret=device(AIGERIM, 1)).json()
+    for pin in ("9999", AIGERIM["pin"]):
+        r = confirm(client, pending, pin)
+        assert r.status_code == 401 and r.json()["detail"]["code"] == "code_required"
+    # /auth/login с нового телефона PIN не проверяет: ответ один для верного, неверного PIN и чужого номера.
+    replies = [login(client, AIGERIM, pin=pin, secret=device(AIGERIM, 1)) for pin in ("9999", AIGERIM["pin"])]
+    replies.append(client.post("/auth/login", json={"phone": "+77000000000", "pin": "1111",
+                                                    "device_secret": device(AIGERIM, 1)}))
+    assert {(r.status_code, r.json()["detail"]["code"]) for r in replies} == {(401, "start_over")}
+    for _ in range(3 * main.LOGIN_ATTEMPTS):
+        confirm(client, pending, "9999")
+        login(client, AIGERIM, pin="9999", secret=device(AIGERIM, 1))
+    # ни одна из этих попыток не потратила попытки PIN владельца
     assert "token" in login(client, AIGERIM).json()
 
 
-def test_sms_code_attempts_are_limited(client):
-    pending = login(client, AIGERIM).json()
-    wrong = "000000" if pending["demo_code"] != "000000" else "111111"
-    for _ in range(main.SMS_ATTEMPTS - 1):
-        assert confirm(client, pending, AIGERIM["pin"], wrong).json()["detail"]["code"] == "invalid_credentials"
-    assert confirm(client, pending, AIGERIM["pin"], wrong).json()["detail"]["code"] == "challenge_expired"
+def test_new_device_full_flow(client):
+    pending = start(client, AIGERIM).json()
+    r = code(client, pending)
+    assert r.status_code == 200 and r.json() == {"next": "pin"}
+    # повтор того же верного кода (ответ потерялся) ничего не ломает и попыток не тратит
+    assert code(client, pending).status_code == 200
+    r = confirm(client, pending, "9999")
+    assert r.status_code == 401 and r.json()["detail"]["code"] == "invalid_credentials"
+    r = confirm(client, pending, AIGERIM["pin"])
+    assert r.status_code == 200 and "token" in r.json()
+    # тем же запросом второй раз не войти, а с привязанного телефона SMS больше не нужно
     assert confirm(client, pending, AIGERIM["pin"]).json()["detail"]["code"] == "challenge_expired"
+    assert code(client, pending).json()["detail"]["code"] == "challenge_expired"
+    assert start(client, AIGERIM).json() == {"next": "pin"}
+    assert "token" in login(client, AIGERIM).json()
+
+
+def test_unknown_number_fails_only_at_pin_like_a_wrong_pin(client):
+    nobody = start(client, AIGERIM, phone="+77000000000").json()
+    real = start(client, DANIYAR).json()
+    assert code(client, nobody).status_code == code(client, real).status_code == 200
+    a, b = confirm(client, nobody, "1111"), confirm(client, real, "9999")
+    assert (a.status_code, a.json()) == (b.status_code, b.json())
+
+
+def test_sms_code_attempts_are_limited(client):
+    pending = start(client, AIGERIM).json()
+    wrong = wrong_code(pending)
+    for left in range(main.SMS_ATTEMPTS - 1, 0, -1):
+        r = code(client, pending, wrong)
+        assert r.status_code == 401 and r.json()["detail"] == {"code": "invalid_code", "attempts_left": left}
+    assert code(client, pending, wrong).json()["detail"]["code"] == "challenge_expired"
+    assert code(client, pending).json()["detail"]["code"] == "challenge_expired"
+    assert confirm(client, pending, AIGERIM["pin"]).json()["detail"]["code"] == "challenge_expired"
+
+
+def test_parallel_sms_codes_do_not_bypass_attempts(client, monkeypatch):
+    pending = start(client, AIGERIM).json()
+    guesses = [f"{i:06d}" for i in range(40) if f"{i:06d}" != pending["demo_code"]][:30]
+    real = main.hmac.compare_digest
+
+    def slow(a, b):
+        time.sleep(0.01)
+        return real(a, b)
+
+    monkeypatch.setattr(main.hmac, "compare_digest", slow)
+    with ThreadPoolExecutor(15) as pool:
+        codes = list(pool.map(lambda g: code(client, pending, g).json()["detail"]["code"], guesses))
+    assert codes.count("invalid_code") == main.SMS_ATTEMPTS - 1
+    assert codes.count("challenge_expired") == len(guesses) - main.SMS_ATTEMPTS + 1
+    assert code(client, pending).json()["detail"]["code"] == "challenge_expired"
 
 
 def test_sms_code_expires(client, monkeypatch):
-    pending = login(client, AIGERIM).json()
+    pending = start(client, AIGERIM).json()
     real = main.time.monotonic
     monkeypatch.setattr(main.time, "monotonic", lambda: real() + main.SMS_TTL + 1)
-    assert confirm(client, pending, AIGERIM["pin"]).json()["detail"]["code"] == "challenge_expired"
+    assert code(client, pending).json()["detail"]["code"] == "challenge_expired"
+
+
+def test_new_device_pin_attempts_are_limited(client):
+    pending = start(client, AIGERIM).json()
+    assert code(client, pending).status_code == 200
+    for _ in range(main.LOGIN_ATTEMPTS):
+        assert confirm(client, pending, "9999").json()["detail"]["code"] == "invalid_credentials"
+    r = confirm(client, pending, AIGERIM["pin"])
+    assert r.status_code == 429 and r.json()["detail"]["code"] == "too_many_attempts"
+    # Новое SMS лимит PIN по номеру не сбрасывает.
+    again = start(client, AIGERIM, secret=device(AIGERIM, 1)).json()
+    code(client, again)
+    assert confirm(client, again, AIGERIM["pin"]).status_code == 429
 
 
 def test_sms_are_limited_per_phone_and_address(client, monkeypatch):
     for i in range(3):
-        assert login(client, AIGERIM, secret=device(AIGERIM, i)).status_code == 200
-    r = login(client, AIGERIM, secret=device(AIGERIM, 9))
+        assert start(client, AIGERIM, secret=device(AIGERIM, i)).status_code == 200
+    r = start(client, AIGERIM, secret=device(AIGERIM, 9))
     assert r.status_code == 429 and r.json()["detail"]["code"] == "too_many_sms"
+    # для несуществующего номера — те же лимиты
+    for i in range(3):
+        assert start(client, AIGERIM, secret=device(AIGERIM, i), phone="+77000000000").status_code == 200
+    assert start(client, AIGERIM, secret=device(AIGERIM, 9), phone="+77000000000").status_code == 429
 
     monkeypatch.setattr(main, "IP_HEADER", "x-real-ip")
     monkeypatch.setattr(main, "_sms_ip", guard.Window(2, 3600))
     ip = {"X-Real-IP": "203.0.113.7"}
-    assert login(client, DANIYAR, headers=ip).status_code == 200
-    assert login(client, MERCHANT, headers=ip).status_code == 200
-    assert login(client, DANIYAR, secret=device(DANIYAR, 5), headers=ip).status_code == 429
-    assert login(client, DANIYAR, secret=device(DANIYAR, 5), headers={"X-Real-IP": "203.0.113.8"}).status_code == 200
+    assert start(client, DANIYAR, headers=ip).status_code == 200
+    assert start(client, MERCHANT, headers=ip).status_code == 200
+    assert start(client, DANIYAR, secret=device(DANIYAR, 5), headers=ip).status_code == 429
+    assert start(client, DANIYAR, secret=device(DANIYAR, 5), headers={"X-Real-IP": "203.0.113.8"}).status_code == 200
 
 
 def test_attempts_from_new_device_do_not_lock_owner(client):
     auth(client, AIGERIM)
-    pending = login(client, AIGERIM, secret=device(AIGERIM, 7)).json()
+    pending = start(client, AIGERIM, secret=device(AIGERIM, 7)).json()
     for _ in range(main.SMS_ATTEMPTS):
-        confirm(client, pending, "9999", "123456")
+        code(client, pending, wrong_code(pending))
+        confirm(client, pending, "9999")
     assert "token" in login(client, AIGERIM).json()
 
 
@@ -396,7 +484,7 @@ def test_devices_list_and_kick(client):
     assert client.get("/me", headers=thief).status_code == 401
     assert client.get("/me", headers=mine).status_code == 200
     # с отвязанного телефона снова нужен код из SMS
-    assert login(client, AIGERIM, secret=device(AIGERIM, 1)).json().get("sms_required") is True
+    assert start(client, AIGERIM, secret=device(AIGERIM, 1)).json()["next"] == "sms"
     assert client.delete(f"/devices/{other['id']}", headers=mine).status_code == 404
 
 
@@ -666,13 +754,14 @@ def test_without_ip_header_one_client_cannot_exhaust_a_shared_limit(client):
     auth(client, DANIYAR)
     pending = []
     for i in range(25):
-        r = client.post("/auth/login", json={"phone": f"+7700{i:07d}", "pin": "1111", "device_secret": device(AIGERIM, i)})
+        r = start(client, AIGERIM, secret=device(AIGERIM, i), phone=f"+7700{i:07d}")
         assert r.status_code == 200, i
         pending.append(r.json())
     for p in pending:
+        code(client, p)
         for _ in range(3):
-            confirm(client, p, "1111", "123456")
-    assert login(client, MERCHANT).json().get("sms_required") is True
+            confirm(client, p, "1111")
+    assert start(client, MERCHANT).json()["next"] == "sms"
     assert "token" in login(client, DANIYAR).json()
 
 
@@ -706,5 +795,5 @@ def test_public_id_rotates_with_bluetooth_id_and_old_one_still_pays(client, monk
 def test_sms_code_is_never_logged(client, caplog):
     import logging
     caplog.set_level(logging.DEBUG)
-    code = login(client, AIGERIM).json()["demo_code"]
-    assert code not in caplog.text
+    sms = start(client, AIGERIM).json()["demo_code"]
+    assert sms not in caplog.text

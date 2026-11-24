@@ -1,9 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Platform;
 import 'dart:math';
 
-import 'package:flutter/foundation.dart' show kReleaseMode;
+import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform, kIsWeb, kReleaseMode;
 import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:local_auth/local_auth.dart';
@@ -244,25 +243,41 @@ class AppState extends ChangeNotifier {
     return secret;
   }
 
-  String get _deviceName => Platform.isIOS ? 'iPhone' : (Platform.isAndroid ? 'Android' : Platform.operatingSystem);
+  String get _deviceName => kIsWeb
+      ? 'Браузер'
+      : switch (defaultTargetPlatform) {
+          TargetPlatform.iOS => 'iPhone',
+          TargetPlatform.android => 'Android',
+          _ => 'Телефон',
+        };
 
-  /// Вход. Возвращает null, если вход выполнен, или запрос кода из SMS, если телефон новый.
-  Future<SmsChallenge?> login(String phone, String pin) async {
-    final result = await api.post('/auth/login', {
+  /// Первый шаг входа — номер. null: телефон привязан к этому номеру, дальше PIN.
+  /// Иначе сервер отправил SMS, и дальше нужен код.
+  Future<SmsChallenge?> startLogin(String phone) async {
+    final result = await api.post('/auth/start', {
       'phone': phone,
-      'pin': pin,
       'device_secret': await _deviceSecret(),
       'device_name': _deviceName,
     });
-    if (result['sms_required'] == true) {
+    if (result['next'] == 'sms') {
       return SmsChallenge(result['challenge'] as String, result['demo_code'] as String?);
     }
-    await _signedIn(result['token'] as String);
     return null;
   }
 
-  Future<void> confirm(SmsChallenge challenge, String code, String pin) async {
-    final result = await api.post('/auth/confirm', {'challenge': challenge.id, 'code': code, 'pin': pin});
+  /// Код из SMS. Верный код только открывает шаг PIN.
+  Future<void> verifyCode(SmsChallenge challenge, String code) =>
+      api.post('/auth/code', {'challenge': challenge.id, 'code': code});
+
+  /// PIN с привязанного телефона.
+  Future<void> login(String phone, String pin) async {
+    final result = await api.post('/auth/login', {'phone': phone, 'pin': pin, 'device_secret': await _deviceSecret()});
+    await _signedIn(result['token'] as String);
+  }
+
+  /// PIN с нового телефона, после верного кода из SMS.
+  Future<void> confirm(SmsChallenge challenge, String pin) async {
+    final result = await api.post('/auth/confirm', {'challenge': challenge.id, 'pin': pin});
     await _signedIn(result['token'] as String);
   }
 
