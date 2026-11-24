@@ -16,12 +16,16 @@ class PinPad extends StatefulWidget {
     this.length = 4,
     this.leading,
     this.deleteLabel = 'Удалить',
+    this.expand = false,
   });
 
   final Future<bool> Function(String pin) onSubmit;
   final int length;
   final Widget? leading;
   final String deleteLabel;
+
+  /// Точки сверху, клавиатура прижата вниз (24 до safe area): для экранов входа и блокировки.
+  final bool expand;
 
   static const keySize = 72.0;
 
@@ -82,43 +86,104 @@ class _PinPadState extends State<PinPad> {
 
   @override
   Widget build(BuildContext context) {
-    Widget digit(String d) => _PadKey(onTap: () => _digit(d), child: Text(d, style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w600, fontFeatures: Q.tabular)));
-    Widget row(List<Widget> keys) => Row(mainAxisSize: MainAxisSize.min, children: [
-          for (var i = 0; i < keys.length; i++) ...[if (i > 0) const SizedBox(width: 24), keys[i]],
-        ]);
-    const gap = SizedBox(height: 14);
+    final reduced = MediaQuery.maybeDisableAnimationsOf(context) ?? false;
+    final dots = Semantics(
+      label: '${_pin.length} / ${widget.length}',
+      liveRegion: true,
+      child: Shake(
+        trigger: _errors,
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          for (var i = 0; i < widget.length; i++) ...[
+            if (i > 0) const SizedBox(width: 16),
+            _Dot(index: i, filled: i < _pin.length, animate: !reduced),
+          ],
+        ]),
+      ),
+    );
+    final keypad = Keypad(
+      onDigit: _digit,
+      onDelete: _pin.isEmpty ? null : _delete,
+      leading: widget.leading,
+      deleteLabel: widget.deleteLabel,
+    );
+    final busy = SizedBox(
+      height: 24,
+      child: _busy
+          ? const Center(child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)))
+          : null,
+    );
 
     return Focus(
       autofocus: true,
       onKeyEvent: _onKey,
+      child: widget.expand
+          ? Column(children: [dots, const SizedBox(height: 8), busy, const Spacer(), keypad, const SizedBox(height: 24)])
+          : Column(mainAxisSize: MainAxisSize.min, children: [dots, const SizedBox(height: 8), busy, const SizedBox(height: 16), keypad]),
+    );
+  }
+}
+
+/// Точка PIN 16×16: пустая — surface2, заполненная — accent; заполняется с лёгким увеличением.
+class _Dot extends StatelessWidget {
+  const _Dot({required this.index, required this.filled, required this.animate});
+  final int index;
+  final bool filled;
+  final bool animate;
+
+  @override
+  Widget build(BuildContext context) {
+    final dot = Container(
+      key: ValueKey('pin-dot-$index'),
+      width: 16,
+      height: 16,
+      decoration: BoxDecoration(shape: BoxShape.circle, color: filled ? Q.accent : Q.surface2),
+    );
+    if (!animate || !filled) return dot;
+    return TweenAnimationBuilder<double>(
+      key: ValueKey('pin-dot-anim-$index'),
+      tween: Tween(begin: 0.6, end: 1),
+      duration: const Duration(milliseconds: 160),
+      curve: Curves.easeOutBack,
+      builder: (_, scale, child) => Transform.scale(scale: scale, child: child),
+      child: dot,
+    );
+  }
+}
+
+/// Цифровая клавиатура: 3 колонки во всю ширину минус 16 с каждой стороны, между рядами 8.
+/// Нажатая клавиша — круг цвета surface. Слева внизу [leading] (Face ID) или пусто, справа «стереть».
+/// PIN: клавиши 72, цифры 30. Сумма: клавиши 56, цифры 26.
+class Keypad extends StatelessWidget {
+  const Keypad({
+    super.key,
+    required this.onDigit,
+    required this.onDelete,
+    this.leading,
+    this.deleteLabel = 'Удалить',
+    this.keyHeight = PinPad.keySize,
+    this.fontSize = 30,
+  });
+
+  final ValueChanged<String> onDigit;
+  final VoidCallback? onDelete;
+  final Widget? leading;
+  final String deleteLabel;
+  final double keyHeight;
+  final double fontSize;
+
+  @override
+  Widget build(BuildContext context) {
+    Widget digit(String d) => _PadKey(
+          size: keyHeight,
+          onTap: () => onDigit(d),
+          child: Text(d,
+              style: TextStyle(fontSize: fontSize, height: 1.2, fontWeight: FontWeight.w500, color: Q.ink, fontFeatures: Q.tabular)),
+        );
+    Widget row(List<Widget> keys) => Row(children: [for (final k in keys) Expanded(child: k)]);
+    const gap = SizedBox(height: 8);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Semantics(
-          label: '${_pin.length} / ${widget.length}',
-          liveRegion: true,
-          child: Shake(
-            trigger: _errors,
-            child: Row(mainAxisSize: MainAxisSize.min, children: [
-              for (var i = 0; i < widget.length; i++)
-                Container(
-                  key: ValueKey('pin-dot-$i'),
-                  width: 14,
-                  height: 14,
-                  margin: const EdgeInsets.symmetric(horizontal: 9),
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: i < _pin.length ? Q.accent : Colors.transparent,
-                    border: Border.all(color: i < _pin.length ? Q.accent : Q.faint, width: 1.5),
-                  ),
-                ),
-            ]),
-          ),
-        ),
-        SizedBox(
-          height: 40,
-          child: _busy
-              ? const Center(child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)))
-              : null,
-        ),
         row([digit('1'), digit('2'), digit('3')]),
         gap,
         row([digit('4'), digit('5'), digit('6')]),
@@ -126,13 +191,13 @@ class _PinPadState extends State<PinPad> {
         row([digit('7'), digit('8'), digit('9')]),
         gap,
         row([
-          SizedBox.square(dimension: PinPad.keySize, child: Center(child: widget.leading)),
+          SizedBox(height: keyHeight, child: Center(child: leading)),
           digit('0'),
           _PadKey(
-            onTap: _pin.isEmpty ? null : _delete,
-            plain: true,
-            semanticLabel: widget.deleteLabel,
-            child: const Icon(Icons.backspace_outlined, size: 26),
+            size: keyHeight,
+            onTap: onDelete,
+            semanticLabel: deleteLabel,
+            child: const Icon(Icons.backspace_outlined, size: 28),
           ),
         ]),
       ]),
@@ -141,10 +206,10 @@ class _PinPadState extends State<PinPad> {
 }
 
 class _PadKey extends StatelessWidget {
-  const _PadKey({required this.onTap, required this.child, this.plain = false, this.semanticLabel});
+  const _PadKey({required this.size, required this.onTap, required this.child, this.semanticLabel});
+  final double size;
   final VoidCallback? onTap;
   final Widget child;
-  final bool plain;
   final String? semanticLabel;
 
   @override
@@ -154,19 +219,20 @@ class _PadKey extends StatelessWidget {
       enabled: onTap != null,
       label: semanticLabel,
       excludeSemantics: semanticLabel != null,
-      child: SizedBox.square(
-        dimension: PinPad.keySize,
-        child: Material(
-          color: plain ? Colors.transparent : Q.surface,
-          shape: CircleBorder(side: plain ? BorderSide.none : const BorderSide(color: Q.line)),
-          clipBehavior: Clip.antiAlias,
-          child: InkWell(
-            onTap: onTap,
-            child: Center(
-              child: IconTheme.merge(
-                data: IconThemeData(color: onTap == null ? Q.faint : Q.text),
-                child: DefaultTextStyle.merge(style: const TextStyle(color: Q.text), child: child),
-              ),
+      child: SizedBox(
+        height: size,
+        child: InkResponse(
+          onTap: onTap,
+          radius: size / 2,
+          containedInkWell: false,
+          highlightShape: BoxShape.circle,
+          highlightColor: Q.surface,
+          splashColor: Colors.transparent,
+          splashFactory: NoSplash.splashFactory,
+          child: Center(
+            child: IconTheme.merge(
+              data: IconThemeData(color: onTap == null ? Q.ink3 : Q.ink),
+              child: child,
             ),
           ),
         ),

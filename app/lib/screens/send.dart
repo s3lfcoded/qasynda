@@ -5,11 +5,17 @@ import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../api.dart';
+import '../cards.dart';
 import '../l10n.dart';
 import '../nearby.dart';
 import '../state.dart';
 import '../theme.dart';
 import '../widgets.dart';
+import '../widgets/pin_pad.dart';
+
+/// Лимиты за перевод (как на сервере): Bluetooth точнее, поэтому лимит выше.
+const limitBluetooth = 500000 * 100;
+const limitGps = 50000 * 100;
 
 /// «Перевести рядом»: список тех, кто поблизости открыл приём.
 class SendScreen extends StatefulWidget {
@@ -101,38 +107,83 @@ class _SendScreenState extends State<SendScreen> {
     final s = _app.s;
     final nothingWorks = !_bluetooth && _location == null;
     return Scaffold(
-      appBar: AppBar(title: Text(s.t('sendNearby'))),
+      appBar: QAppBar(title: s.t('sendNearby')),
       body: SafeArea(
-        child: _people.isEmpty
-            ? Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(28),
-                  child: Column(mainAxisSize: MainAxisSize.min, children: [
-                    const Radar(child: Icon(Icons.near_me_rounded, size: 44, color: Q.accent)),
-                    const SizedBox(height: 16),
-                    Text(_error != null ? s.error(_error!) : s.t('searching'),
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 8),
-                    Text(nothingWorks ? s.t('needNearby') : s.t(_gpsIgnored ? 'gpsIgnored' : 'searchHint'),
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 15, height: 1.35, color: nothingWorks ? Q.danger : Q.muted)),
+        top: false,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(Q.gutter, 8, Q.gutter, 16),
+              children: [
+                // Поиск идёт всё время, пока экран открыт: баннер остаётся и над списком.
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: Q.line),
+                  ),
+                  child: Row(children: [
+                    SearchRadar(color: nothingWorks ? Q.amberInk : Q.accent),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text(_error != null ? s.error(_error!) : s.t('searching'), style: Q.rowTitle.copyWith(color: Q.ink)),
+                        const SizedBox(height: 4),
+                        Text(
+                          nothingWorks ? s.t('needNearby') : s.t(_gpsIgnored ? 'gpsIgnored' : 'searchHint'),
+                          style: Q.secondary.copyWith(color: nothingWorks ? Q.amberInk : Q.ink2),
+                        ),
+                      ]),
+                    ),
                   ]),
                 ),
-              )
-            : ListView.separated(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-                itemCount: _people.length,
-                separatorBuilder: (_, _) => const SizedBox(height: 10),
-                itemBuilder: (_, i) => _PersonCard(person: _people[i], s: s, onTap: () => _choose(_people[i])),
+                if (_people.isNotEmpty) ...[
+                  SectionLabel(s.t('nearYou')),
+                  QGroup(
+                    dividerIndent: 76,
+                    children: [
+                      for (final person in _people) _PersonRow(person: person, s: s, onTap: () => _choose(person)),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(Q.gutter + 4, 0, Q.gutter + 4, 24),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.info_outline_rounded, size: 20, color: Q.ink2),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(s.t('limitsInfo', {'bt': money(limitBluetooth), 'gps': money(limitGps)}), style: Q.secondary),
               ),
+            ]),
+          ),
+        ]),
       ),
     );
   }
 }
 
-class _PersonCard extends StatelessWidget {
-  const _PersonCard({required this.person, required this.s, required this.onTap});
+/// Теги человека рядом: «ИП в банке» и способ, которым его нашли.
+List<Widget> proximityTags(S s, Map<String, dynamic> person, {bool short = false}) {
+  final merchant = person['is_merchant'] == true;
+  final bluetooth = person['method'] == 'bluetooth';
+  return [
+    if (merchant) QTag(kind: TagKind.merchant, label: s.t('merchant')),
+    if (bluetooth)
+      QTag(kind: TagKind.bluetooth, label: short ? 'Bluetooth' : s.t('btNear'))
+    else
+      // точное расстояние сервер не сообщает: по нему можно вычислить, где стоит человек
+      QTag(
+        kind: TagKind.gps,
+        label: short ? 'GPS' : s.t(person['proximity'] == 'close' ? 'gpsClose' : 'gpsNear'),
+      ),
+  ];
+}
+
+class _PersonRow extends StatelessWidget {
+  const _PersonRow({required this.person, required this.s, required this.onTap});
   final Map<String, dynamic> person;
   final S s;
   final VoidCallback onTap;
@@ -140,39 +191,33 @@ class _PersonCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final merchant = person['is_merchant'] == true;
-    final bluetooth = person['method'] == 'bluetooth';
-    return QCard(
+    return InkWell(
       onTap: onTap,
-      padding: const EdgeInsets.all(16),
-      child: Row(children: [
-        Avatar(name: '${person['name']}', merchant: merchant),
-        const SizedBox(width: 14),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(merchant ? '${person['business_name']}' : '${person['name']}',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
-            if (merchant)
-              Padding(
-                padding: const EdgeInsets.only(top: 2),
-                child: Text('${person['name']}', style: const TextStyle(fontSize: 14, color: Q.muted)),
-              ),
-            const SizedBox(height: 8),
-            Wrap(spacing: 6, runSpacing: 6, children: [
-              if (merchant) Pill(icon: Icons.verified_rounded, label: s.t('merchant'), color: Q.ok),
-              bluetooth
-                  ? Pill(icon: Icons.bluetooth_rounded, label: s.t('btNear'), color: Q.blue)
-                  : Pill(
-                      icon: Icons.location_on_rounded,
-                      // точное расстояние сервер не сообщает: по нему можно вычислить, где стоит человек
-                      label: s.t(person['proximity'] == 'close' ? 'gpsClose' : 'gpsNear'),
-                      color: Q.muted),
-            ]),
+      highlightColor: Q.surface2,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(minHeight: 56),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(children: [
+            Avatar(name: '${person['name']}', kind: merchant ? AvatarKind.shop : AvatarKind.initial),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(merchant ? '${person['business_name']}' : '${person['name']}',
+                    maxLines: 1, overflow: TextOverflow.ellipsis, style: Q.rowTitle.copyWith(color: Q.ink)),
+                if (merchant) ...[
+                  const SizedBox(height: 4),
+                  Text('${person['name']}', style: Q.secondary),
+                ],
+                const SizedBox(height: 8),
+                Wrap(spacing: 8, runSpacing: 8, children: proximityTags(s, person)),
+              ]),
+            ),
+            const SizedBox(width: 12),
+            const Icon(Icons.chevron_right_rounded, color: Q.ink3),
           ]),
         ),
-        const Icon(Icons.chevron_right_rounded, color: Q.muted),
-      ]),
+      ),
     );
   }
 }
@@ -197,6 +242,8 @@ class AmountScreen extends StatefulWidget {
 class _AmountScreenState extends State<AmountScreen> {
   final _amount = TextEditingController();
   final _note = TextEditingController();
+  final _amountFocus = FocusNode();
+  final _noteFocus = FocusNode();
   // Один ключ на экран: повторное нажатие или обрыв связи не спишет деньги второй раз.
   final _key = List.generate(16, (_) => Random.secure().nextInt(256).toRadixString(16).padLeft(2, '0')).join();
   bool _busy = false;
@@ -205,13 +252,47 @@ class _AmountScreenState extends State<AmountScreen> {
   bool _uncertain = false;
 
   @override
+  void initState() {
+    super.initState();
+    void rebuild() {
+      if (mounted) setState(() {});
+    }
+
+    _noteFocus.addListener(rebuild);
+    _amountFocus.addListener(rebuild);
+  }
+
+  @override
   void dispose() {
     _amount.dispose();
     _note.dispose();
+    _amountFocus.dispose();
+    _noteFocus.dispose();
     super.dispose();
   }
 
   int get _tiyn => (int.tryParse(_amount.text) ?? 0) * 100;
+
+  void _setAmount(String text) {
+    _amount.value = TextEditingValue(text: text, selection: TextSelection.collapsed(offset: text.length));
+    setState(() {});
+  }
+
+  void _digit(String d) {
+    if (_uncertain || _busy) return;
+    if (_noteFocus.hasFocus) _amountFocus.requestFocus();
+    final text = _amount.text;
+    if ((text.isEmpty || text == '0') && d == '0') return;
+    if (text.length >= 7) return;
+    HapticFeedback.selectionClick();
+    _setAmount(text == '0' ? d : text + d);
+  }
+
+  void _delete() {
+    if (_uncertain || _busy || _amount.text.isEmpty) return;
+    HapticFeedback.selectionClick();
+    _setAmount(_amount.text.substring(0, _amount.text.length - 1));
+  }
 
   Future<void> _submit() async {
     final app = AppScope.of(context);
@@ -239,6 +320,67 @@ class _AmountScreenState extends State<AmountScreen> {
     }
   }
 
+  Widget _amountDisplay() {
+    final value = _tiyn ~/ 100;
+    final digits = value == 0 ? '' : '$value';
+    final glyphs = [
+      for (var i = 0; i < digits.length; i++) (i > 0 && (digits.length - i) % 3 == 0) ? '$nbsp${digits[i]}' : digits[i],
+    ];
+    final ink = Q.amountInput.copyWith(color: Q.ink);
+    final faint = Q.amountInput.copyWith(color: Q.ink3);
+    final focused = _amountFocus.hasFocus || !_noteFocus.hasFocus;
+    return SizedBox(
+      height: 60,
+      child: Stack(children: [
+        Center(
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              if (digits.isEmpty) Text('0', style: faint) else TypedText(glyphs: glyphs, style: ink),
+              AnimatedOpacity(
+                duration: const Duration(milliseconds: 160),
+                opacity: focused && !_uncertain ? 1 : 0,
+                child: Container(
+                  width: 3,
+                  height: 44,
+                  margin: const EdgeInsets.only(left: 4, right: 8),
+                  decoration: BoxDecoration(color: Q.accent, borderRadius: BorderRadius.circular(2)),
+                ),
+              ),
+              Text('₸', style: faint),
+            ]),
+          ),
+        ),
+        // Невидимое поле: ввод с аппаратной клавиатуры и для экранного диктора. Своя клавиатура ниже.
+        Positioned.fill(
+          child: TextSelectionTheme(
+            data: const TextSelectionThemeData(selectionColor: Colors.transparent),
+            child: TextField(
+              controller: _amount,
+              focusNode: _amountFocus,
+              autofocus: true,
+              readOnly: _uncertain,
+              keyboardType: TextInputType.none,
+              showCursor: false,
+              enableInteractiveSelection: false,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(7)],
+              style: const TextStyle(color: Colors.transparent),
+              decoration: InputDecoration(
+                filled: false,
+                border: InputBorder.none,
+                focusedBorder: InputBorder.none,
+                labelText: AppScope.of(context).s.t('amount'),
+                labelStyle: const TextStyle(color: Colors.transparent),
+                floatingLabelBehavior: FloatingLabelBehavior.never,
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+          ),
+        ),
+      ]),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final app = AppScope.of(context);
@@ -249,130 +391,272 @@ class _AmountScreenState extends State<AmountScreen> {
     final over = _tiyn > limit;
     final under = _tiyn > 0 && _tiyn < widget.minAmount;
     final ready = _tiyn >= widget.minAmount && !over && !_busy;
+    final typingNote = _noteFocus.hasFocus;
+    final keyboard = MediaQuery.viewInsetsOf(context).bottom > 0;
 
     return Scaffold(
-      appBar: AppBar(),
+      appBar: QAppBar(title: s.t('transfer')),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
-          child: Column(children: [
-            Expanded(
-              child: ListView(keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag, children: [
+        top: false,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Expanded(
+            child: ListView(
+              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+              padding: const EdgeInsets.fromLTRB(Q.gutter, 8, Q.gutter, 16),
+              children: [
                 Row(children: [
-                  Avatar(name: '${person['name']}', merchant: merchant, size: 60),
-                  const SizedBox(width: 14),
+                  Avatar(name: '${person['name']}', kind: merchant ? AvatarKind.shop : AvatarKind.initial),
+                  const SizedBox(width: 12),
                   Expanded(
                     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       Text(merchant ? '${person['business_name']}' : '${person['name']}',
-                          style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w800, height: 1.15)),
-                      const SizedBox(height: 6),
-                      if (merchant) Pill(icon: Icons.verified_rounded, label: s.t('merchant'), color: Q.ok),
+                          maxLines: 2, overflow: TextOverflow.ellipsis, style: Q.rowTitle.copyWith(color: Q.ink)),
+                      if (merchant || person['method'] != null) ...[
+                        const SizedBox(height: 8),
+                        Wrap(spacing: 8, runSpacing: 8, children: proximityTags(s, person, short: true)),
+                      ],
                     ]),
                   ),
                 ]),
+                const SizedBox(height: 32),
+                _amountDisplay(),
+                const SizedBox(height: 8),
+                Text(
+                  over
+                      ? s.t('overLimit', {'sum': money(limit)})
+                      : under
+                          ? s.t('underMin', {'sum': money(widget.minAmount)})
+                          : s.t('limit', {'min': money(widget.minAmount), 'sum': money(limit)}),
+                  textAlign: TextAlign.center,
+                  style: Q.secondary.copyWith(color: over || under ? Q.danger : Q.ink2),
+                ),
                 const SizedBox(height: 24),
-                TextField(
-                  controller: _amount,
-                  autofocus: true,
-                  readOnly: _uncertain,
-                  keyboardType: TextInputType.number,
-                  inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(7)],
-                  style: const TextStyle(fontSize: 34, fontWeight: FontWeight.w800),
-                  decoration: InputDecoration(labelText: s.t('amount')),
-                  onChanged: (_) => setState(() {}),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(6, 8, 6, 14),
-                  child: Text(
-                    over
-                        ? s.t('overLimit', {'sum': money(limit)})
-                        : under
-                            ? s.t('underMin', {'sum': money(widget.minAmount)})
-                            : s.t('limit', {'min': money(widget.minAmount), 'sum': money(limit)}),
-                    style: TextStyle(fontSize: 13.5, color: over || under ? Q.danger : Q.muted),
-                  ),
-                ),
-                TextField(
+                _NoteField(
                   controller: _note,
+                  focusNode: _noteFocus,
                   readOnly: _uncertain,
-                  // Сервер считает длину по символам Юникода, а не по видимым знакам: эмодзи из нескольких
-                  // символов иначе проходили бы здесь и отклонялись там.
-                  inputFormatters: [_CodePointLimit(140)],
-                  textCapitalization: TextCapitalization.sentences,
-                  decoration: InputDecoration(labelText: s.t('note'), counterText: ''),
+                  label: s.t('note'),
+                  hint: s.t('noteHint'),
                 ),
-              ]),
+              ],
             ),
-            FilledButton(
+          ),
+          if (!typingNote)
+            Keypad(
+              keyHeight: 56,
+              fontSize: 26,
+              onDigit: _digit,
+              onDelete: _amount.text.isEmpty || _uncertain ? null : _delete,
+              deleteLabel: s.t('pinDelete'),
+            ),
+          Padding(
+            padding: EdgeInsets.fromLTRB(Q.gutter, typingNote ? 0 : 16, Q.gutter, keyboard ? 12 : 8),
+            child: QButton(
+              label: _tiyn > 0 ? s.t('pay', {'sum': money(_tiyn)}) : s.t('payEmpty'),
               onPressed: ready ? _submit : null,
-              child: _busy
-                  ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5, color: Q.onAccent))
-                  : Text(_tiyn > 0 ? s.t('pay', {'sum': money(_tiyn)}) : s.t('payEmpty')),
+              busy: _busy,
             ),
-          ]),
-        ),
+          ),
+        ]),
       ),
     );
   }
 }
 
-class ReceiptScreen extends StatelessWidget {
+/// Комментарий: подпись 13/16 над текстом 16/24, справа карандаш. Высота 56.
+class _NoteField extends StatelessWidget {
+  const _NoteField({
+    required this.controller,
+    required this.focusNode,
+    required this.readOnly,
+    required this.label,
+    required this.hint,
+  });
+  final TextEditingController controller;
+  final FocusNode focusNode;
+  final bool readOnly;
+  final String label;
+  final String hint;
+
+  @override
+  Widget build(BuildContext context) {
+    final focused = focusNode.hasFocus;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 160),
+      height: 56,
+      padding: const EdgeInsets.only(left: 16),
+      decoration: BoxDecoration(
+        color: focused ? Q.bg : Q.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: focused ? Q.accent : Q.surface, width: 2),
+      ),
+      child: Row(children: [
+        Expanded(
+          child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(label, style: Q.tag.copyWith(color: Q.ink2, fontWeight: FontWeight.w400)),
+            TextField(
+              controller: controller,
+              focusNode: focusNode,
+              readOnly: readOnly,
+              // Сервер считает длину по символам Юникода, а не по видимым знакам: эмодзи из нескольких
+              // символов иначе проходили бы здесь и отклонялись там.
+              inputFormatters: [_CodePointLimit(140)],
+              textCapitalization: TextCapitalization.sentences,
+              style: const TextStyle(fontSize: 16, height: 24 / 16, color: Q.ink),
+              decoration: InputDecoration(
+                isCollapsed: true,
+                contentPadding: EdgeInsets.zero,
+                filled: false,
+                border: InputBorder.none,
+                focusedBorder: InputBorder.none,
+                hintText: hint,
+                hintStyle: const TextStyle(fontSize: 16, height: 24 / 16, color: Q.ink3),
+              ),
+            ),
+          ]),
+        ),
+        IconButton(
+          onPressed: readOnly ? null : focusNode.requestFocus,
+          tooltip: label,
+          style: IconButton.styleFrom(fixedSize: const Size.square(44)),
+          icon: const Icon(Icons.edit_outlined, size: 20, color: Q.ink2),
+        ),
+      ]),
+    );
+  }
+}
+
+class ReceiptScreen extends StatefulWidget {
   const ReceiptScreen({super.key, required this.receipt});
   final Map<String, dynamic> receipt;
 
   @override
+  State<ReceiptScreen> createState() => _ReceiptScreenState();
+}
+
+class _ReceiptScreenState extends State<ReceiptScreen> {
+  /// Основная карта — «Списано с Visa •• 8823». Если карт нет или запрос не удался, строки нет.
+  BankCard? _card;
+  bool _asked = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_asked) return;
+    _asked = true;
+    _loadCard();
+  }
+
+  Future<void> _loadCard() async {
+    try {
+      final list = await CardsApi(AppScope.of(context).api).list();
+      final primary = list.items.where((c) => c.isPrimary).firstOrNull;
+      if (mounted && primary != null) setState(() => _card = primary);
+    } catch (_) {}
+  }
+
+  @override
   Widget build(BuildContext context) {
     final s = AppScope.of(context).s;
+    final receipt = widget.receipt;
+    final card = _card;
     final recipient = receipt['recipient'] as Map<String, dynamic>;
     final merchant = recipient['is_merchant'] == true;
     final bluetooth = receipt['method'] == 'bluetooth';
+    final note = '${receipt['note'] ?? ''}';
+    final created = receipt['created_at'];
+    final reduced = MediaQuery.disableAnimationsOf(context);
+
+    Widget row(String label, Widget value) => ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 48),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Row(children: [
+              Text(label, style: const TextStyle(fontSize: 15, height: 20 / 15, color: Q.ink2)),
+              const SizedBox(width: 16),
+              Expanded(child: Align(alignment: AlignmentDirectional.centerEnd, child: value)),
+            ]),
+          ),
+        );
+    Text bold(String text) => Text(text,
+        textAlign: TextAlign.end,
+        style: const TextStyle(fontSize: 15, height: 20 / 15, fontWeight: FontWeight.w600, color: Q.ink, fontFeatures: Q.tabular));
+
     return Scaffold(
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(children: [
-            Expanded(
-              child: Center(
-                child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  Container(
-                    width: 96,
-                    height: 96,
-                    decoration: const BoxDecoration(color: Q.accent, shape: BoxShape.circle),
-                    child: const Icon(Icons.check_rounded, size: 56, color: Q.onAccent),
-                  ),
-                  const SizedBox(height: 20),
-                  Text(s.t('sent'), style: const TextStyle(fontSize: 17, color: Q.muted)),
-                  const SizedBox(height: 6),
-                  Sensitive(
-                    builder: (_, shown) => Text(shown ? money(receipt['amount'] as int) : '$masked ₸',
-                        style: const TextStyle(fontSize: 40, fontWeight: FontWeight.w900)),
-                  ),
-                  const SizedBox(height: 10),
-                  Text(merchant ? '${recipient['business_name']}' : '${recipient['name']}',
-                      textAlign: TextAlign.center, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 12),
-                  Wrap(spacing: 6, runSpacing: 6, alignment: WrapAlignment.center, children: [
-                    if (merchant) Pill(icon: Icons.verified_rounded, label: s.t('merchant'), color: Q.ok),
-                    Pill(
-                      icon: bluetooth ? Icons.bluetooth_rounded : Icons.location_on_rounded,
-                      label: bluetooth ? 'Bluetooth' : 'GPS',
-                      color: bluetooth ? Q.blue : Q.muted,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(Q.gutter, 48, Q.gutter, 16),
+              children: [
+                Center(
+                  child: TweenAnimationBuilder<double>(
+                    tween: Tween(begin: reduced ? 1 : 0.6, end: 1),
+                    duration: const Duration(milliseconds: 240),
+                    curve: Curves.easeOutBack,
+                    builder: (_, scale, child) => Transform.scale(scale: scale, child: child),
+                    child: Container(
+                      width: 72,
+                      height: 72,
+                      decoration: const BoxDecoration(color: Q.accent, shape: BoxShape.circle),
+                      child: const Icon(Icons.check_rounded, size: 40, color: Q.onAccent),
                     ),
-                  ]),
-                ]),
-              ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+                Text(s.t('sent'), textAlign: TextAlign.center, style: Q.appBar.copyWith(color: Q.ink2, fontWeight: FontWeight.w400)),
+                const SizedBox(height: 4),
+                Center(
+                  child: Sensitive(
+                    builder: (_, shown) => RollingAmount(
+                      money(receipt['amount'] as int),
+                      style: Q.balance.copyWith(color: Q.ink),
+                      hidden: !shown,
+                      rollIn: true,
+                      delay: const Duration(milliseconds: 120),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(merchant ? '${recipient['business_name']}' : '${recipient['name']}',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 16, height: 24 / 16, fontWeight: FontWeight.w600, color: Q.ink)),
+                const SizedBox(height: 32),
+                Material(
+                  color: Q.surface,
+                  borderRadius: BorderRadius.circular(20),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Column(children: [
+                      if (merchant) row(s.t('recipient'), bold('${recipient['name']}')),
+                      if (merchant) row(s.t('status'), QTag(kind: TagKind.merchant, label: s.t('merchant'))),
+                      row(
+                        s.t('foundBy'),
+                        QTag(kind: bluetooth ? TagKind.bluetooth : TagKind.gps, label: bluetooth ? 'Bluetooth' : 'GPS'),
+                      ),
+                      if (note.isNotEmpty) row(s.t('note'), bold(note)),
+                      if (card != null)
+                        row(s.t('paidFrom'), bold('${brandName(card.brand) ?? ''} ••\u00A0${card.last4}'.trim())),
+                      if (created is num)
+                        row(s.t('date'), bold(s.date(DateTime.fromMillisecondsSinceEpoch((created * 1000).round())))),
+                    ]),
+                  ),
+                ),
+              ],
             ),
-            FilledButton(
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(Q.gutter, 0, Q.gutter, 8),
+            child: QButton(
+              label: s.t('done'),
               onPressed: () => Navigator.of(context).popUntil((route) => route.isFirst),
-              child: Text(s.t('done')),
             ),
-          ]),
-        ),
+          ),
+        ]),
       ),
     );
   }
 }
-
 
 /// Ограничивает текст числом символов Юникода (как считает сервер), а не видимых знаков.
 class _CodePointLimit extends TextInputFormatter {

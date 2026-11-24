@@ -391,7 +391,7 @@ void main() {
     await tester.pump();
     tester.takeException();
 
-    await tester.tap(find.text('Принять рядом'));
+    await tester.tap(find.byIcon(Icons.sensors_rounded));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 600));
     await tester.tap(find.text('Готово'));
@@ -571,7 +571,7 @@ void main() {
 
     await tester.enterText(find.byType(TextField), '+77010000001');
     await tester.pump();
-    await tester.tap(find.text('Далее'));
+    await tester.tap(find.text('Продолжить'));
     await _until(tester, find.byType(CodeCells));
     expect(find.byType(CodeCells), findsOneWidget);
     expect(find.text('Учебное SMS: 123456'), findsOneWidget);
@@ -629,7 +629,7 @@ void main() {
 
     await tester.enterText(find.byType(TextField), '+77010000001');
     await tester.pump();
-    await tester.tap(find.text('Далее'));
+    await tester.tap(find.text('Продолжить'));
     await _until(tester, find.byType(PinPad));
     expect(find.byType(CodeCells), findsNothing);
     for (final d in '1111'.split('')) {

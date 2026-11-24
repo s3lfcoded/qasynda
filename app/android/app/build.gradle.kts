@@ -47,3 +47,8 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // Распознавание текста для сканирования карты (канал qasynda/ocr в MainActivity). Модель латиницы внутри APK.
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+}

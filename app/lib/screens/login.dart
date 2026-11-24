@@ -1,11 +1,15 @@
-import 'package:flutter/services.dart';
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:material_ui/material_ui.dart';
 
 import '../api.dart';
+import '../l10n.dart';
 import '../state.dart';
 import '../theme.dart';
 import '../widgets.dart';
 import '../widgets/code_cells.dart';
+import '../widgets/phone_field.dart';
 import '../widgets/pin_pad.dart';
 
 enum _Step { phone, code, pin }
@@ -20,29 +24,64 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _phone = TextEditingController(text: '+7');
+  /// Повторное SMS — не раньше чем через минуту.
+  static const _resendAfter = 60;
+
+  final _phone = TextEditingController();
+  final _cells = GlobalKey<CodeCellsState>();
   _Step _step = _Step.phone;
   SmsChallenge? _challenge;
   bool _busy = false;
+  DateTime? _sentAt;
+  Timer? _tick;
 
   @override
   void dispose() {
+    _tick?.cancel();
     _phone.dispose();
     super.dispose();
   }
 
-  bool get _phoneValid => RegExp(r'^\+7\d{10}$').hasMatch(_phone.text);
+  String get _number => '+7${phoneDigits(_phone.text)}';
+
+  bool get _phoneValid => phoneDigits(_phone.text).length == 10;
+
+  int get _resendLeft {
+    final sent = _sentAt;
+    if (sent == null) return 0;
+    return math.max(0, _resendAfter - DateTime.now().difference(sent).inSeconds);
+  }
+
+  void _startResendTimer() {
+    _tick?.cancel();
+    _sentAt = DateTime.now();
+    _tick = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) return;
+      setState(() {});
+      if (_resendLeft == 0) timer.cancel();
+    });
+  }
+
+  void _stopResendTimer() {
+    _tick?.cancel();
+    _tick = null;
+  }
 
   Future<void> _start() async {
     final app = AppScope.of(context);
     setState(() => _busy = true);
     try {
-      final challenge = await app.startLogin(_phone.text);
+      final challenge = await app.startLogin(_number);
       if (!mounted) return;
       setState(() {
         _challenge = challenge;
         _step = challenge == null ? _Step.pin : _Step.code;
       });
+      if (challenge != null) {
+        _startResendTimer();
+      } else {
+        _stopResendTimer();
+      }
     } on ApiError catch (e) {
       if (mounted) showError(context, app.s.error(e.code, e.detail));
     } finally {
@@ -54,6 +93,7 @@ class _LoginScreenState extends State<LoginScreen> {
     final app = AppScope.of(context);
     try {
       await app.verifyCode(_challenge!, code);
+      _stopResendTimer();
       if (mounted) setState(() => _step = _Step.pin);
       return true;
     } on ApiError catch (e) {
@@ -67,12 +107,15 @@ class _LoginScreenState extends State<LoginScreen> {
     final challenge = _challenge;
     try {
       if (challenge == null) {
-        await app.login(_phone.text, pin);
+        await app.login(_number, pin);
       } else {
+        // Первый вход с этого телефона: на главном предложим привязать карту, если карт нет.
+        app.offerCards = true;
         await app.confirm(challenge, pin);
       }
       return true;
     } on ApiError catch (e) {
+      app.offerCards = false;
       if (mounted) _failed(e);
       return false;
     }
@@ -85,10 +128,13 @@ class _LoginScreenState extends State<LoginScreen> {
     showError(context, e.code == 'invalid_credentials' ? s.t('pinWrong') : s.error(e.code, e.detail));
   }
 
-  void _back() => setState(() {
-        _step = _Step.phone;
-        _challenge = null;
-      });
+  void _back() {
+    _stopResendTimer();
+    setState(() {
+      _step = _Step.phone;
+      _challenge = null;
+    });
+  }
 
   Future<void> _editServer() async {
     final app = AppScope.of(context);
@@ -106,116 +152,210 @@ class _LoginScreenState extends State<LoginScreen> {
     if (value != null && value.trim().isNotEmpty) await app.setServer(value);
   }
 
-  List<Widget> _phoneStep(BuildContext context) {
+  Widget _phoneStep(BuildContext context, bool keyboard) {
     final s = AppScope.of(context).s;
     final ready = _phoneValid && !_busy;
-    return [
-      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-        if (canChangeServer)
-          IconButton(onPressed: _editServer, icon: const Icon(Icons.dns_outlined, color: Q.muted))
-        else
-          const SizedBox(height: 48),
-        const LangToggle(),
-      ]),
-      const SizedBox(height: 48),
-      // ListView растягивает детей на всю ширину, поэтому логотип выравниваем явно.
-      Align(
-        alignment: Alignment.centerLeft,
-        child: Container(
-          width: 76,
-          height: 76,
-          decoration: BoxDecoration(color: Q.accent, borderRadius: BorderRadius.circular(26)),
-          child: const Icon(Icons.near_me_rounded, size: 38, color: Q.onAccent),
+    return SafeArea(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: Q.gutter),
+          child: SizedBox(
+            height: 56,
+            child: Row(children: [
+              const QasyndaMark(size: 32),
+              const SizedBox(width: 8),
+              Text('Qasynda', style: Q.section.copyWith(color: Q.ink, letterSpacing: -0.2)),
+              const Spacer(),
+              if (canChangeServer)
+                IconButton(
+                  onPressed: _editServer,
+                  tooltip: s.t('server'),
+                  icon: const Icon(Icons.dns_outlined, color: Q.ink3, size: 20),
+                ),
+              const LangToggle(),
+            ]),
+          ),
         ),
-      ),
-      const SizedBox(height: 24),
-      const Text('Qasynda', style: TextStyle(fontSize: 40, fontWeight: FontWeight.w900, height: 1)),
-      const SizedBox(height: 8),
-      Text(s.t('tagline'), style: const TextStyle(fontSize: 17, color: Q.muted)),
-      const SizedBox(height: 40),
-      TextField(
-        controller: _phone,
-        keyboardType: TextInputType.phone,
-        autofillHints: const [AutofillHints.telephoneNumber],
-        inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[+\d]')), LengthLimitingTextInputFormatter(12)],
-        decoration: InputDecoration(labelText: s.t('phone')),
-        onChanged: (_) => setState(() {}),
-        onSubmitted: (_) => ready ? _start() : null,
-      ),
-      const SizedBox(height: 24),
-      FilledButton(
-        onPressed: ready ? _start : null,
-        child: _busy
-            ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5, color: Q.onAccent))
-            : Text(s.t('next')),
-      ),
-    ];
+        Expanded(
+          child: ListView(
+            // На цифровой клавиатуре iPhone нет кнопки «Готово»: клавиатура убирается жестом вниз.
+            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+            padding: const EdgeInsets.fromLTRB(Q.gutter, 32, Q.gutter, 24),
+            children: [
+              Text(s.t('phoneTitle'), style: Q.title.copyWith(color: Q.ink)),
+              const SizedBox(height: 8),
+              Text(s.t('phoneHint'), style: Q.body),
+              const SizedBox(height: 24),
+              PhoneField(
+                controller: _phone,
+                label: s.t('phone'),
+                clearLabel: s.t('clear'),
+                onChanged: (_) => setState(() {}),
+                onSubmitted: (_) => ready ? _start() : null,
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: EdgeInsets.fromLTRB(Q.gutter, 0, Q.gutter, keyboard ? 12 : 8),
+          child: QButton(label: s.t('continue'), onPressed: ready ? _start : null, busy: _busy),
+        ),
+      ]),
+    );
   }
 
-  List<Widget> _header(BuildContext context, String title, String hint) {
-    final s = AppScope.of(context).s;
-    return [
-      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-        TextButton.icon(
-          onPressed: _back,
-          icon: const Icon(Icons.arrow_back_rounded),
-          label: Text(s.t('back')),
-          style: TextButton.styleFrom(foregroundColor: Q.muted),
-        ),
-        const LangToggle(),
-      ]),
-      const SizedBox(height: 32),
-      Text(title, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w800, height: 1.15)),
-      const SizedBox(height: 8),
-      Text(hint, style: const TextStyle(fontSize: 15, color: Q.muted, height: 1.35)),
-    ];
-  }
-
-  List<Widget> _codeStep(BuildContext context, SmsChallenge challenge) {
+  Widget _codeStep(BuildContext context, SmsChallenge challenge) {
     final s = AppScope.of(context).s;
     final demo = challenge.demoCode;
-    return [
-      ..._header(context, s.t('smsTitle'), s.t('smsHint', {'phone': _phone.text})),
-      if (demo != null) ...[
-        const SizedBox(height: 16),
-        // Учебный режим сервера: настоящего SMS нет, код показывается здесь.
-        Align(alignment: Alignment.centerLeft, child: Pill(icon: Icons.sms_outlined, label: s.t('demoSms', {'code': demo}), color: Q.blue)),
+    final left = _resendLeft;
+    final Widget footer;
+    if (left > 0) {
+      final parts = s.t('resendIn').split('{t}');
+      final time = '${left ~/ 60}:${(left % 60).toString().padLeft(2, '0')}';
+      const style = TextStyle(fontSize: 15, height: 20 / 15, color: Q.ink2, fontFeatures: Q.tabular);
+      footer = Text.rich(TextSpan(style: style, children: [
+        TextSpan(text: parts.first),
+        WidgetSpan(
+          alignment: PlaceholderAlignment.baseline,
+          baseline: TextBaseline.alphabetic,
+          child: RollingAmount(time, style: style),
+        ),
+        if (parts.length > 1) TextSpan(text: parts.last),
+      ]));
+    } else {
+      footer = Align(
+        alignment: AlignmentDirectional.centerStart,
+        child: TextButton(
+          onPressed: _busy ? null : _start,
+          style: TextButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8), minimumSize: const Size(0, 40)),
+          child: Text(s.t('resend')),
+        ),
+      );
+    }
+    return ListView(
+      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+      padding: const EdgeInsets.fromLTRB(Q.gutter, 8, Q.gutter, 24),
+      children: [
+        Text(s.t('smsTitle'), style: Q.title.copyWith(color: Q.ink)),
+        const SizedBox(height: 8),
+        Text(s.t('smsHint', {'phone': phoneText(_number)}), style: Q.body),
+        if (demo != null) ...[
+          const SizedBox(height: 24),
+          // Учебный режим сервера: настоящего SMS нет, код показывается здесь.
+          Container(
+            height: 48,
+            padding: const EdgeInsetsDirectional.only(start: 16, end: 4),
+            decoration: BoxDecoration(color: Q.amberSoft, borderRadius: BorderRadius.circular(16)),
+            child: Row(children: [
+              const Icon(Icons.sms_rounded, size: 20, color: Q.amberInk),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(s.t('demoSms', {'code': demo}),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Q.label.copyWith(color: Q.amberInk, fontFeatures: Q.tabular)),
+              ),
+              TextButton(
+                onPressed: () => _cells.currentState?.fill(demo),
+                style: TextButton.styleFrom(
+                  foregroundColor: Q.amberInk,
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  minimumSize: const Size(0, 40),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                child: Text(s.t('paste')),
+              ),
+            ]),
+          ),
+        ],
+        const SizedBox(height: 24),
+        CodeCells(
+          key: _cells,
+          onCompleted: _code,
+          pasteLabel: s.t('paste'),
+          semanticLabel: s.t('smsCode'),
+          showPaste: demo == null,
+          footer: footer,
+        ),
       ],
-      const SizedBox(height: 24),
-      CodeCells(
-        key: ValueKey(challenge.id),
-        onCompleted: _code,
-        pasteLabel: s.t('paste'),
-        semanticLabel: s.t('smsCode'),
-      ),
-    ];
+    );
   }
 
-  List<Widget> _pinStep(BuildContext context) {
+  Widget _pinStep(BuildContext context) {
     final s = AppScope.of(context).s;
-    return [
-      ..._header(context, s.t('pinTitle'), s.t('pinHint', {'phone': _phone.text})),
-      const SizedBox(height: 32),
-      Center(child: PinPad(onSubmit: _pin, deleteLabel: s.t('pinDelete'))),
-    ];
+    return Column(children: [
+      const SizedBox(height: 40),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: Q.gutter),
+        child: Column(children: [
+          Text(s.t('pinTitle'), textAlign: TextAlign.center, style: Q.titleM.copyWith(color: Q.ink)),
+          const SizedBox(height: 8),
+          Text(s.t('pinHint', {'phone': phoneText(_number)}),
+              textAlign: TextAlign.center, style: Q.body.copyWith(fontFeatures: Q.tabular)),
+        ]),
+      ),
+      const SizedBox(height: 40),
+      Expanded(child: PinPad(onSubmit: _pin, deleteLabel: s.t('pinDelete'), expand: true)),
+    ]);
   }
 
   @override
   Widget build(BuildContext context) {
     final challenge = _challenge;
-    return Scaffold(
-      body: SafeArea(
-        child: ListView(
-          // На цифровой клавиатуре iPhone нет кнопки «Готово»: клавиатура убирается жестом вниз.
-          keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-          padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
-          children: switch (_step) {
-            _Step.phone => _phoneStep(context),
-            _Step.code => _codeStep(context, challenge!),
-            _Step.pin => _pinStep(context),
-          },
-        ),
+    final keyboard = MediaQuery.viewInsetsOf(context).bottom > 0;
+    // Шаги входа сменяют друг друга сдвигом, как экраны.
+    final Widget body = switch (_step) {
+      _Step.phone => _phoneStep(context, keyboard),
+      _Step.code => SafeArea(top: false, child: _codeStep(context, challenge!)),
+      _Step.pin => SafeArea(top: false, child: _pinStep(context)),
+    };
+    return PopScope(
+      canPop: _step == _Step.phone,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _back();
+      },
+      child: Scaffold(
+        appBar: _step == _Step.phone ? null : QAppBar(onBack: _back),
+        body: _StepSwitcher(step: _step.index, child: KeyedSubtree(key: ValueKey(_step), child: body)),
       ),
+    );
+  }
+}
+
+/// Смена шагов входа: новый шаг въезжает сдвигом и проявляется — вперёд справа, назад слева.
+/// Старый шаг убирается сразу, чтобы на экране никогда не было двух клавиатур или полей.
+class _StepSwitcher extends StatefulWidget {
+  const _StepSwitcher({required this.step, required this.child});
+  final int step;
+  final Widget child;
+
+  @override
+  State<_StepSwitcher> createState() => _StepSwitcherState();
+}
+
+class _StepSwitcherState extends State<_StepSwitcher> {
+  bool _forward = true;
+
+  @override
+  void didUpdateWidget(_StepSwitcher old) {
+    super.didUpdateWidget(old);
+    if (old.step != widget.step) _forward = widget.step > old.step;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final reduced = MediaQuery.disableAnimationsOf(context);
+    final dir = _forward ? 1.0 : -1.0;
+    return TweenAnimationBuilder<double>(
+      key: ValueKey(widget.step),
+      tween: Tween(begin: 0, end: 1),
+      duration: Duration(milliseconds: reduced ? 150 : (_forward ? 300 : 200)),
+      curve: Curves.easeOutCubic,
+      builder: (context, t, child) => Opacity(
+        opacity: t,
+        child: reduced ? child : FractionalTranslation(translation: Offset(dir * 0.08 * (1 - t), 0), child: child),
+      ),
+      child: widget.child,
     );
   }
 }

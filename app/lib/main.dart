@@ -12,7 +12,7 @@ import 'widgets.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  SystemChrome.setSystemUIOverlayStyle(darkOverlay);
+  SystemChrome.setSystemUIOverlayStyle(lightOverlay);
   runApp(QasyndaApp(state: AppState()..boot()));
 }
 

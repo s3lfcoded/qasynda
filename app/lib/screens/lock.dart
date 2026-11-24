@@ -55,38 +55,53 @@ class _LockScreenState extends State<LockScreen> {
     final name = '${app.profile?['name'] ?? ''}'.split(' ').first;
     final ios = defaultTargetPlatform == TargetPlatform.iOS;
     return Scaffold(
+      appBar: QAppBar(
+        back: false,
+        actions: [
+          TextButton(
+            onPressed: app.logout,
+            style: TextButton.styleFrom(
+              minimumSize: const Size(0, 44),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              textStyle: const TextStyle(fontFamily: Q.font, fontSize: 16, height: 24 / 16, fontWeight: FontWeight.w600),
+            ),
+            child: Text(s.t('logout')),
+          ),
+        ],
+      ),
       body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(24, 48, 24, 24),
-          children: [
-            Align(alignment: Alignment.centerLeft, child: Avatar(name: name, size: 64)),
-            const SizedBox(height: 20),
-            Text(s.t('hello', {'name': name}),
-                style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w900, height: 1.1)),
-            const SizedBox(height: 8),
-            Text(s.t('lockTitle'), style: const TextStyle(fontSize: 17, color: Q.muted)),
-            const SizedBox(height: 32),
-            Center(
-              child: PinPad(
-                onSubmit: _submit,
-                deleteLabel: s.t('pinDelete'),
-                leading: app.biometricReady
-                    ? IconButton(
-                        onPressed: _biometrics,
-                        tooltip: s.t('useBio'),
-                        iconSize: 32,
-                        color: Q.text,
-                        icon: Icon(ios ? Icons.face_rounded : Icons.fingerprint_rounded),
-                      )
-                    : null,
-              ),
+        top: false,
+        child: Column(children: [
+          const SizedBox(height: 16),
+          Avatar(name: name, kind: AvatarKind.me, size: 64),
+          const SizedBox(height: 16),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: Q.gutter),
+            child: Column(children: [
+              Text(s.t('hello', {'name': name}), textAlign: TextAlign.center, style: Q.titleM.copyWith(color: Q.ink)),
+              const SizedBox(height: 8),
+              Text(s.t('lockTitle'), textAlign: TextAlign.center, style: Q.body),
+            ]),
+          ),
+          const SizedBox(height: 32),
+          Expanded(
+            child: PinPad(
+              onSubmit: _submit,
+              deleteLabel: s.t('pinDelete'),
+              expand: true,
+              leading: app.biometricReady
+                  ? IconButton(
+                      onPressed: _biometrics,
+                      tooltip: s.t('useBio'),
+                      style: IconButton.styleFrom(fixedSize: const Size.square(56)),
+                      icon: ios
+                          ? const FaceIdIcon(size: 32, color: Q.accent)
+                          : const Icon(Icons.fingerprint_rounded, size: 32, color: Q.accent),
+                    )
+                  : null,
             ),
-            const SizedBox(height: 16),
-            Center(
-              child: TextButton(onPressed: app.logout, child: Text(s.t('forgot'), style: const TextStyle(color: Q.muted))),
-            ),
-          ],
-        ),
+          ),
+        ]),
       ),
     );
   }

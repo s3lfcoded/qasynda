@@ -1,9 +1,13 @@
 import 'package:material_ui/material_ui.dart';
 
 import '../api.dart';
+import '../cards.dart';
+import '../cards_l10n.dart';
 import '../state.dart';
 import '../theme.dart';
 import '../widgets.dart';
+import 'cards.dart';
+import 'support.dart';
 
 /// Настройки: скрытие сумм, Face ID и устройства, на которых открыт аккаунт.
 class SettingsScreen extends StatefulWidget {
@@ -17,6 +21,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final AppState _app;
   bool _started = false;
   List<Map<String, dynamic>>? _devices;
+  int? _cardCount;
 
   @override
   void didChangeDependencies() {
@@ -25,6 +30,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _started = true;
     _app = AppScope.of(context);
     _load();
+    _loadCards();
+  }
+
+  /// Счётчик в строке «Мои карты»: привязанные карты и учебная карта Qasynda.
+  Future<void> _loadCards() async {
+    try {
+      final list = await CardsApi(_app.api).list();
+      if (mounted) setState(() => _cardCount = list.items.length + 1);
+    } catch (_) {
+      // Без счётчика строка всё равно открывает «Мои карты».
+    }
   }
 
   Future<void> _load() async {
@@ -66,7 +82,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _when(num seconds) {
     final at = DateTime.fromMillisecondsSinceEpoch((seconds * 1000).round());
     String two(int v) => v.toString().padLeft(2, '0');
-    return '${two(at.day)}.${two(at.month)} · ${two(at.hour)}:${two(at.minute)}';
+    return '${two(at.day)}.${two(at.month)}, ${two(at.hour)}:${two(at.minute)}';
+  }
+
+  /// Шторка выбора языка.
+  Future<void> _pickLanguage() async {
+    final app = _app;
+    await showQSheet<void>(
+      context,
+      (context) => Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text(app.s.t('language'), style: Q.appBar.copyWith(color: Q.ink)),
+        const SizedBox(height: 16),
+        QGroup(children: [
+          for (final (code, label) in const [('ru', 'Русский'), ('kk', 'Қазақша')])
+            QRow(
+              title: label,
+              trailing: app.lang == code
+                  ? const Icon(Icons.check_circle_rounded, color: Q.accent)
+                  : const Icon(Icons.radio_button_unchecked_rounded, color: Q.ink3),
+              onTap: () {
+                app.setLang(code);
+                Navigator.pop(context);
+              },
+            ),
+        ]),
+      ]),
+    );
+  }
+
+  Future<void> _open(Widget screen) async {
+    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => screen));
+    _loadCards();
   }
 
   @override
@@ -77,103 +123,129 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final others = devices?.where((d) => d['current'] != true).toList() ?? const [];
 
     return Scaffold(
-      appBar: AppBar(title: Text(s.t('settings'))),
+      appBar: QAppBar(title: s.t('settings')),
       body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
-          children: [
-            _Header(s.t('security')),
-            QCard(
-              padding: EdgeInsets.zero,
-              child: Column(children: [
-                SwitchListTile(
-                  value: app.hideSensitive,
-                  onChanged: app.setHideSensitive,
-                  title: Text(s.t('hideSensitive')),
-                  subtitle: Text(s.t('hideSensitiveHint'), style: const TextStyle(color: Q.muted, fontSize: 13)),
-                ),
-                if (app.biometricAvailable) ...[
-                  const Divider(height: 1, color: Q.line),
-                  SwitchListTile(
-                    value: app.biometricEnabled,
-                    onChanged: (value) async {
-                      final ok = await app.setBiometric(value);
-                      if (!ok && context.mounted) showError(context, app.s.t('bioFailed'));
-                    },
-                    title: Text(s.t('bio')),
+        top: false,
+        child: CustomScrollView(slivers: [
+          SliverFillRemaining(
+            hasScrollBody: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(Q.gutter, 8, Q.gutter, 8),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                QGroup(dividerIndent: 52, children: [
+                  QRow(
+                    icon: Icons.credit_card_rounded,
+                    title: CardText(app.lang).t('title'),
+                    value: _cardCount == null ? null : '$_cardCount',
+                    chevron: true,
+                    onTap: () => _open(const CardsScreen()),
                   ),
-                ],
+                  QRow(
+                    icon: Icons.support_agent_rounded,
+                    title: s.t('support'),
+                    chevron: true,
+                    onTap: () => _open(const SupportScreen()),
+                  ),
+                  QRow(
+                    icon: Icons.language_rounded,
+                    title: s.t('language'),
+                    value: app.lang == 'kk' ? 'Қазақша' : 'Русский',
+                    chevron: true,
+                    onTap: _pickLanguage,
+                  ),
+                ]),
+                SectionLabel(s.t('security')),
+                QGroup(children: [
+                  QRow(
+                    title: s.t('hideSensitive'),
+                    subtitle: s.t('hideSensitiveHint'),
+                    trailing: QToggle(value: app.hideSensitive, onChanged: app.setHideSensitive),
+                    onTap: () => app.setHideSensitive(!app.hideSensitive),
+                  ),
+                  if (app.biometricAvailable)
+                    QRow(
+                      title: s.t('bio'),
+                      trailing: QToggle(value: app.biometricEnabled, onChanged: (value) => _setBio(app, value)),
+                      onTap: () => _setBio(app, !app.biometricEnabled),
+                    ),
+                ]),
+                SectionLabel(s.t('devices')),
+                if (devices == null)
+                  const Padding(padding: EdgeInsets.all(24), child: Center(child: CircularProgressIndicator()))
+                else
+                  QGroup(dividerIndent: 68, children: [
+                    for (final device in devices)
+                      QRow(
+                        leading: Container(
+                          width: 40,
+                          height: 40,
+                          decoration: const BoxDecoration(color: Q.bg, shape: BoxShape.circle),
+                          child: Icon(
+                            '${device['name']}' == 'iPhone' ? Icons.phone_iphone_rounded : Icons.smartphone_rounded,
+                            size: 20,
+                            color: Q.ink,
+                          ),
+                        ),
+                        title: '${device['name']}',
+                        subtitle: device['current'] == true
+                            ? s.t('thisDevice')
+                            : s.t('lastSeen', {'when': _when(device['last_seen'] as num)}),
+                        subtitleStyle: device['current'] == true
+                            ? Q.secondary.copyWith(color: Q.accentInk, fontWeight: FontWeight.w500)
+                            : Q.secondary.copyWith(fontFeatures: Q.tabular),
+                        trailing: device['current'] == true
+                            ? null
+                            : TextButton(
+                                onPressed: () async {
+                                  if (await _ask(s.t('kickConfirm', {'name': '${device['name']}'}))) {
+                                    await _run(() => app.removeDevice('${device['id']}'));
+                                  }
+                                },
+                                style: TextButton.styleFrom(
+                                  backgroundColor: Q.dangerSoft,
+                                  foregroundColor: Q.danger,
+                                  minimumSize: const Size(0, 36),
+                                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                                  shape: const StadiumBorder(),
+                                ),
+                                child: Text(s.t('kick')),
+                              ),
+                      ),
+                    if (others.isNotEmpty)
+                      InkWell(
+                        onTap: () async {
+                          if (await _ask('${s.t('kickOthers')}?')) await _run(app.logoutOthers);
+                        },
+                        child: Container(
+                          constraints: const BoxConstraints(minHeight: 48),
+                          alignment: Alignment.center,
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          child: Text(s.t('kickOthers'),
+                              textAlign: TextAlign.center, style: Q.label.copyWith(color: Q.danger)),
+                        ),
+                      ),
+                  ]),
+                const Spacer(),
+                const SizedBox(height: 24),
+                QButton(
+                  kind: QButtonKind.danger,
+                  icon: Icons.logout_rounded,
+                  label: s.t('forgot'),
+                  onPressed: () async {
+                    Navigator.of(context).popUntil((route) => route.isFirst);
+                    await app.logout();
+                  },
+                ),
               ]),
             ),
-            const SizedBox(height: 24),
-            _Header(s.t('devices')),
-            if (devices == null)
-              const Padding(padding: EdgeInsets.all(24), child: Center(child: CircularProgressIndicator()))
-            else
-              QCard(
-                padding: EdgeInsets.zero,
-                child: Column(children: [
-                  for (var i = 0; i < devices.length; i++) ...[
-                    if (i > 0) const Divider(height: 1, color: Q.line),
-                    ListTile(
-                      leading: Icon(
-                        '${devices[i]['name']}' == 'iPhone' ? Icons.phone_iphone_rounded : Icons.phone_android_rounded,
-                        color: Q.muted,
-                      ),
-                      title: Text('${devices[i]['name']}'),
-                      subtitle: Text(
-                        devices[i]['current'] == true
-                            ? s.t('thisDevice')
-                            : s.t('lastSeen', {'when': _when(devices[i]['last_seen'] as num)}),
-                        style: TextStyle(color: devices[i]['current'] == true ? Q.ok : Q.muted, fontSize: 13),
-                      ),
-                      trailing: devices[i]['current'] == true
-                          ? null
-                          : TextButton(
-                              onPressed: () async {
-                                final device = devices[i];
-                                if (await _ask(s.t('kickConfirm', {'name': '${device['name']}'}))) {
-                                  await _run(() => app.removeDevice('${device['id']}'));
-                                }
-                              },
-                              child: Text(s.t('kick'), style: const TextStyle(color: Q.danger)),
-                            ),
-                    ),
-                  ],
-                ]),
-              ),
-            if (others.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              OutlinedButton(
-                onPressed: () async {
-                  if (await _ask('${s.t('kickOthers')}?')) await _run(app.logoutOthers);
-                },
-                child: Text(s.t('kickOthers'), style: const TextStyle(color: Q.danger)),
-              ),
-            ],
-            const SizedBox(height: 32),
-            FilledButton.tonal(
-              onPressed: () async {
-                Navigator.of(context).popUntil((route) => route.isFirst);
-                await app.logout();
-              },
-              child: Text(s.t('logout')),
-            ),
-          ],
-        ),
+          ),
+        ]),
       ),
     );
   }
-}
 
-class _Header extends StatelessWidget {
-  const _Header(this.text);
-  final String text;
-
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.fromLTRB(6, 0, 6, 10),
-        child: Text(text.toUpperCase(),
-            style: const TextStyle(fontSize: 12, color: Q.muted, fontWeight: FontWeight.w700, letterSpacing: 1.4)),
-      );
+  Future<void> _setBio(AppState app, bool value) async {
+    final ok = await app.setBiometric(value);
+    if (!ok && mounted) showError(context, app.s.t('bioFailed'));
+  }
 }

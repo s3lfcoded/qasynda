@@ -243,6 +243,19 @@ def test_history_and_realtime_notification(client):
     assert out["direction"] == "out" and out["counterparty"] == MERCHANT["business_name"]
     incoming = client.get("/transfers", headers=seller).json()["items"][0]
     assert incoming["direction"] == "in" and incoming["counterparty"] == "Айгерим К."
+    assert out["is_merchant"] is True and incoming["is_merchant"] is False
+
+
+def test_history_marks_merchant_counterparty_in_both_directions(client):
+    merchant, person = auth(client, MERCHANT), auth(client, DANIYAR)
+    beacon = client.post("/nearby/beacon", json={}, headers=person).json()
+    assert client.post("/transfers", json=bt_body(beacon), headers=merchant).status_code == 200
+    beacon = client.post("/nearby/beacon", json={}, headers=merchant).json()
+    assert client.post("/transfers", json=bt_body(beacon), headers=person).status_code == 200
+    mine = {(i["direction"], i["is_merchant"]) for i in client.get("/transfers", headers=person).json()["items"]}
+    theirs = {(i["direction"], i["is_merchant"]) for i in client.get("/transfers", headers=merchant).json()["items"]}
+    assert mine == {("in", True), ("out", True)}
+    assert theirs == {("in", False), ("out", False)}
 
 
 def test_websocket_refuses_before_accepting(client):

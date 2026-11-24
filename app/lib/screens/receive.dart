@@ -9,6 +9,7 @@ import '../nearby.dart';
 import '../state.dart';
 import '../theme.dart';
 import '../widgets.dart';
+import 'send.dart' show limitBluetooth, limitGps;
 
 /// «Принять рядом»: пока экран открыт, телефон виден отправителям поблизости.
 class ReceiveScreen extends StatefulWidget {
@@ -107,76 +108,151 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
   Widget build(BuildContext context) {
     final s = _app.s;
     final last = _last;
-    return Scaffold(
-      appBar: AppBar(title: Text(s.t('receiveNearby'))),
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
-          child: Column(children: [
-            Expanded(
-              child: Center(
-                child: last == null
-                    ? Column(mainAxisSize: MainAxisSize.min, children: [
-                        Radar(
-                          child: Container(
-                            width: 84,
-                            height: 84,
-                            decoration: BoxDecoration(color: Q.accent, borderRadius: BorderRadius.circular(30)),
-                            child: const Icon(Icons.sensors_rounded, size: 40, color: Q.onAccent),
+    final initial = '${_app.profile?['name'] ?? ''}';
+    // Лимит приёма зависит от того, что работает: Bluetooth точнее, поэтому до 500 000 ₸.
+    Widget status({
+      required bool on,
+      required IconData onIcon,
+      required IconData offIcon,
+      required String title,
+      required String hint,
+      required int sum,
+    }) =>
+        ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 56),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Row(children: [
+              Icon(on ? onIcon : offIcon, color: on ? Q.accent : Q.amberInk),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(title, style: Q.label.copyWith(color: Q.ink)),
+                  const SizedBox(height: 4),
+                  Text.rich(
+                    TextSpan(style: Q.secondary, children: [
+                      for (final (i, part) in s.t(hint).split('{sum}').indexed) ...[
+                        if (i > 0)
+                          WidgetSpan(
+                            alignment: PlaceholderAlignment.baseline,
+                            baseline: TextBaseline.alphabetic,
+                            child: RollingAmount(money(sum), style: Q.secondary.copyWith(fontFeatures: Q.tabular)),
                           ),
-                        ),
-                        const SizedBox(height: 20),
-                        Text(_online ? s.t('visible') : s.t('err.network'),
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800)),
-                        const SizedBox(height: 8),
-                        Text(s.t('visibleHint'),
-                            textAlign: TextAlign.center, style: const TextStyle(fontSize: 15, color: Q.muted, height: 1.35)),
-                      ])
-                    : Column(mainAxisSize: MainAxisSize.min, children: [
-                        Container(
-                          width: 96,
-                          height: 96,
-                          decoration: const BoxDecoration(color: Q.accent, shape: BoxShape.circle),
-                          child: const Icon(Icons.check_rounded, size: 56, color: Q.onAccent),
-                        ),
-                        const SizedBox(height: 20),
-                        Sensitive(
-                          builder: (_, shown) => Text(
-                              s.t('received', {'sum': shown ? money(last['amount'] as int) : '$masked ₸'}),
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w900)),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(s.t('from', {'name': '${last['sender']}'}),
-                            style: const TextStyle(fontSize: 17, color: Q.muted)),
-                        if (last['note'] != null && '${last['note']}'.isNotEmpty) ...[
-                          const SizedBox(height: 10),
-                          Text('«${last['note']}»', textAlign: TextAlign.center, style: const TextStyle(fontSize: 16)),
-                        ],
-                      ]),
-              ),
-            ),
-            Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
-              Pill(
-                icon: Icons.bluetooth_rounded,
-                label: s.t(_bluetooth ? 'btOn' : 'btOff'),
-                color: _bluetooth ? Q.blue : Q.muted,
-              ),
-              Pill(
-                icon: Icons.location_on_rounded,
-                label: s.t(_gps ? 'gpsOn' : 'gpsOff'),
-                color: _gps ? Q.ok : Q.muted,
+                        TextSpan(text: part),
+                      ],
+                    ]),
+                  ),
+                ]),
               ),
             ]),
-            if (_checked && !_bluetooth && !_gps) ...[
-              const SizedBox(height: 12),
-              Text(s.t('needNearby'), textAlign: TextAlign.center, style: const TextStyle(color: Q.danger)),
-            ],
-            const SizedBox(height: 16),
-            FilledButton(onPressed: () => Navigator.pop(context), child: Text(s.t('done'))),
-          ]),
-        ),
+          ),
+        );
+
+    return Scaffold(
+      appBar: QAppBar(title: s.t('receiveNearby')),
+      body: SafeArea(
+        top: false,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(Q.gutter, 16, Q.gutter, 16),
+              children: last == null
+                  ? [
+                      Center(
+                        child: RadiusRings(
+                          child: Container(
+                            width: 80,
+                            height: 80,
+                            alignment: Alignment.center,
+                            decoration: const BoxDecoration(color: Q.accent, shape: BoxShape.circle),
+                            child: Text(initial.isEmpty ? '' : initial.characters.first.toUpperCase(),
+                                style: const TextStyle(fontSize: 28, height: 1, fontWeight: FontWeight.w600, color: Q.onAccent)),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        child: Column(children: [
+                          Text(_online ? s.t('visible') : s.t('err.network'),
+                              textAlign: TextAlign.center, style: Q.titleM.copyWith(color: Q.ink)),
+                          const SizedBox(height: 8),
+                          Text(s.t('visibleHint'), textAlign: TextAlign.center, style: Q.body),
+                        ]),
+                      ),
+                      const SizedBox(height: 24),
+                      QGroup(dividerIndent: 52, children: [
+                        status(
+                          on: _bluetooth || !_checked,
+                          onIcon: Icons.bluetooth_rounded,
+                          offIcon: Icons.bluetooth_disabled_rounded,
+                          title: s.t(_bluetooth || !_checked ? 'btOn' : 'btOff'),
+                          hint: _bluetooth || !_checked ? 'canReceive' : 'btEnable',
+                          sum: limitBluetooth,
+                        ),
+                        status(
+                          on: _gps || !_checked,
+                          onIcon: Icons.location_on_rounded,
+                          offIcon: Icons.location_off_rounded,
+                          title: s.t(_gps || !_checked ? 'gpsOn' : 'gpsOff'),
+                          hint: _gps || !_checked ? 'canReceive' : 'gpsEnable',
+                          sum: limitGps,
+                        ),
+                      ]),
+                      if (_checked && !_bluetooth && !_gps) ...[
+                        const SizedBox(height: 16),
+                        Text(s.t('needNearby'), textAlign: TextAlign.center, style: Q.secondary.copyWith(color: Q.amberInk)),
+                      ],
+                    ]
+                  : [
+                      const SizedBox(height: 32),
+                      Center(
+                        child: TweenAnimationBuilder<double>(
+                          tween: Tween(begin: MediaQuery.disableAnimationsOf(context) ? 1 : 0.6, end: 1),
+                          duration: const Duration(milliseconds: 240),
+                          curve: Curves.easeOutBack,
+                          builder: (_, scale, child) => Transform.scale(scale: scale, child: child),
+                          child: Container(
+                            width: 72,
+                            height: 72,
+                            decoration: const BoxDecoration(color: Q.accent, shape: BoxShape.circle),
+                            child: const Icon(Icons.check_rounded, size: 40, color: Q.onAccent),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      Text(s.t('receivedHidden'),
+                          textAlign: TextAlign.center, style: Q.appBar.copyWith(color: Q.ink2, fontWeight: FontWeight.w400)),
+                      const SizedBox(height: 4),
+                      Center(
+                        child: Sensitive(
+                          builder: (_, shown) => RollingAmount(
+                            '+${money(last['amount'] as int)}',
+                            key: ValueKey(last),
+                            style: Q.balance.copyWith(color: Q.accentInk),
+                            hidden: !shown,
+                            rollIn: true,
+                            delay: const Duration(milliseconds: 120),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(s.t('from', {'name': '${last['sender']}'}),
+                          textAlign: TextAlign.center, style: Q.body.copyWith(color: Q.ink2)),
+                      if (last['note'] != null && '${last['note']}'.isNotEmpty) ...[
+                        const SizedBox(height: 16),
+                        Text('«${last['note']}»',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(fontSize: 16, height: 24 / 16, color: Q.ink)),
+                      ],
+                    ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(Q.gutter, 0, Q.gutter, 8),
+            child: QButton(label: s.t('done'), onPressed: () => Navigator.pop(context)),
+          ),
+        ]),
       ),
     );
   }

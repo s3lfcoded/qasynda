@@ -1,4 +1,4 @@
-"""SQLite-хранилище: пользователи, устройства, сессии, переводы. Суммы — целые тиыны."""
+"""SQLite-хранилище: пользователи, устройства, сессии, переводы, карты. Суммы — целые тиыны."""
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +9,8 @@ import sqlite3
 import time
 import uuid
 from contextlib import closing
+
+from .cards import CardError
 
 SESSION_TTL = 12 * 3600
 # Сессия «разблокирована» только 5 минут после последнего действия: переводы, баланс и устройства
@@ -58,6 +60,19 @@ CREATE TABLE IF NOT EXISTS transfers(
     UNIQUE(sender_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS transfers_sender_time ON transfers(sender_id, created_at);
+-- Привязанные карты. Полного номера и CVV здесь нет и быть не должно (PCI DSS).
+CREATE TABLE IF NOT EXISTS cards(
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    brand TEXT NOT NULL,
+    last4 TEXT NOT NULL CHECK(length(last4) = 4),
+    expiry TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    UNIQUE(user_id, brand, last4, expiry)
+);
+CREATE INDEX IF NOT EXISTS cards_user ON cards(user_id, created_at);
 """
 
 # Учебные пользователи. Только для демо: включается переменной QASYNDA_SEED_DEMO=1.
@@ -341,10 +356,77 @@ def history(user_id: int, limit: int) -> list[dict]:
     with closing(connect()) as c:
         rows = c.execute(
             "SELECT t.id, t.amount, t.method, t.note, t.created_at, t.sender_id,"
-            " s.full_name AS sender_name, r.full_name AS recipient_name,"
+            " s.full_name AS sender_name, s.is_merchant AS sender_is_merchant, r.full_name AS recipient_name,"
             " r.is_merchant AS recipient_is_merchant, r.business_name AS recipient_business"
             " FROM transfers t JOIN users s ON s.id = t.sender_id JOIN users r ON r.id = t.recipient_id"
             " WHERE t.sender_id=? OR t.recipient_id=? ORDER BY t.created_at DESC LIMIT ?",
             (user_id, user_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+_CARD_COLUMNS = "id, brand, last4, expiry, holder, is_primary, created_at"
+
+
+def _card(row: sqlite3.Row) -> dict:
+    card = dict(row)
+    card["is_primary"] = bool(card["is_primary"])
+    return card
+
+
+def cards(user_id: int) -> list[dict]:
+    with closing(connect()) as c:
+        rows = c.execute(f"SELECT {_CARD_COLUMNS} FROM cards WHERE user_id=? ORDER BY created_at, id",
+                         (user_id,)).fetchall()
+        return [_card(r) for r in rows]
+
+
+def add_card(user_id: int, brand: str, last4: str, expiry: str, holder: str, max_cards: int) -> dict:
+    """Лимит и повтор проверяются в той же транзакции, что и запись: параллельные запросы их не обойдут.
+    Первая карта становится основной."""
+    card_id = uuid.uuid4().hex[:16]
+    with closing(connect()) as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("SELECT 1 FROM cards WHERE user_id=? AND brand=? AND last4=? AND expiry=?",
+                         (user_id, brand, last4, expiry)).fetchone():
+                raise CardError("card_exists", 409)
+            count = c.execute("SELECT COUNT(*) FROM cards WHERE user_id=?", (user_id,)).fetchone()[0]
+            if count >= max_cards:
+                raise CardError("too_many_cards", 409)
+            c.execute("INSERT INTO cards(id, user_id, brand, last4, expiry, holder, is_primary, created_at)"
+                      " VALUES(?,?,?,?,?,?,?,?)",
+                      (card_id, user_id, brand, last4, expiry, holder, int(count == 0), time.time()))
+            row = c.execute(f"SELECT {_CARD_COLUMNS} FROM cards WHERE id=?", (card_id,)).fetchone()
+            c.execute("COMMIT")
+        except BaseException:
+            c.execute("ROLLBACK")
+            raise
+    return _card(row)
+
+
+def remove_card(user_id: int, card_id: str) -> bool:
+    """Удаляет только свою карту. Если удалена основная, основной становится самая старая из оставшихся."""
+    with closing(connect()) as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT is_primary FROM cards WHERE user_id=? AND id=?", (user_id, card_id)).fetchone()
+        if row is None:
+            c.execute("ROLLBACK")
+            return False
+        c.execute("DELETE FROM cards WHERE user_id=? AND id=?", (user_id, card_id))
+        if row["is_primary"]:
+            c.execute("UPDATE cards SET is_primary=1 WHERE id=(SELECT id FROM cards WHERE user_id=?"
+                      " ORDER BY created_at, id LIMIT 1)", (user_id,))
+        c.execute("COMMIT")
+    return True
+
+
+def set_primary_card(user_id: int, card_id: str) -> bool:
+    with closing(connect()) as c:
+        c.execute("BEGIN IMMEDIATE")
+        if not c.execute("SELECT 1 FROM cards WHERE user_id=? AND id=?", (user_id, card_id)).fetchone():
+            c.execute("ROLLBACK")
+            return False
+        c.execute("UPDATE cards SET is_primary=(id=?) WHERE user_id=?", (card_id, user_id))
+        c.execute("COMMIT")
+    return True

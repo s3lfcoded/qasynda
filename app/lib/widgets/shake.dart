@@ -14,7 +14,7 @@ class Shake extends StatefulWidget {
 }
 
 class _ShakeState extends State<Shake> with SingleTickerProviderStateMixin {
-  late final _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 420));
+  late final _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 360));
 
   @override
   void didUpdateWidget(Shake oldWidget) {
@@ -36,7 +36,7 @@ class _ShakeState extends State<Shake> with SingleTickerProviderStateMixin {
       animation: _controller,
       builder: (context, child) {
         final t = _controller.value;
-        return Transform.translate(offset: Offset(sin(t * pi * 6) * 10 * (1 - t), 0), child: child);
+        return Transform.translate(offset: Offset(sin(t * pi * 6) * 8 * (1 - t), 0), child: child);
       },
       child: widget.child,
     );

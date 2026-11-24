@@ -10,6 +10,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'api.dart';
+import 'cards.dart' show VirtualCardSecret;
 import 'l10n.dart';
 
 /// Адрес сервера задаётся при сборке:
@@ -54,6 +55,13 @@ class AppState extends ChangeNotifier {
   bool ready = false;
   Map<String, dynamic>? profile;
   List<Map<String, dynamic>> history = [];
+
+  /// Реквизиты учебной карты: запрашиваются при первом перевороте карты и живут только в памяти,
+  /// до выхода из аккаунта. В хранилище не пишутся.
+  VirtualCardSecret? virtualSecret;
+
+  /// Первый вход с нового телефона: на главном предложить привязать карту, если карт ещё нет.
+  bool offerCards = false;
 
   /// Приложение открыто, но код или Face ID ещё не введены.
   bool locked = false;
@@ -411,6 +419,8 @@ class AppState extends ChangeNotifier {
     api.token = null;
     profile = null;
     history = [];
+    virtualSecret = null;
+    offerCards = false;
     locked = false;
     _pendingAlerts.clear();
     messengerKey.currentState?.clearSnackBars();

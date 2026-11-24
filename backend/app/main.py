@@ -12,13 +12,13 @@ import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from . import db, guard, nearby, notes, sms
+from . import cards, db, guard, nearby, notes, sms
 
 # Лимит одного перевода в тиынах. Близость по Bluetooth подделать труднее, чем координаты,
 # поэтому перевод только по GPS ограничен жёстче.
@@ -56,6 +56,8 @@ _beacon_rate = guard.Window(12, 60)          # приложение продле
 _gps_people = guard.Distinct(30, 3600)       # столько разных людей по GPS можно увидеть за час
 _transfer_rate = guard.Window(10, 60)
 _pair_rate = guard.Window(3, 600)            # одному и тому же получателю
+_card_add_rate = guard.Window(5, 3600)       # привязанных карт за час
+_card_secret_rate = guard.Window(10, 3600)   # показов реквизитов виртуальной карты за час
 
 HexId = Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")]
 # Сколько услышанных меток учитывается. Остальные отбрасываются: иначе передатчик, рассылающий сотни
@@ -112,6 +114,18 @@ class BeaconIn(BaseModel):
 class DiscoverIn(BaseModel):
     location: Location | None = None
     ble_ids: list[HexId] = Field(default_factory=list, max_length=500)
+
+
+class CardIn(BaseModel):
+    """Номер приходит один раз и не сохраняется; CVV сервер не принимает вовсе."""
+    number: str = Field(pattern=r"^[0-9 ]{12,23}$")
+    expiry: str = Field(pattern=r"^(0[1-9]|1[0-2])/[0-9]{2}$")
+    holder: str = Field(min_length=2, max_length=26, pattern=r"^[A-Za-z][A-Za-z .'-]*$")
+
+    @field_validator("holder", mode="before")
+    @classmethod
+    def _squeeze(cls, value: object) -> object:
+        return " ".join(value.split()) if isinstance(value, str) else value
 
 
 class TransferIn(BaseModel):
@@ -614,6 +628,63 @@ def logout_others(user: Unlocked, authorization: Annotated[str | None, Header()]
     return {"removed": len(removed)}
 
 
+CardId = Annotated[str, Path(pattern=r"^[0-9a-f]{16}$")]
+
+
+@app.get("/cards")
+def card_list(user: Unlocked) -> dict:
+    return {"items": db.cards(user["id"]), "max": cards.MAX_CARDS}
+
+
+@app.post("/cards")
+def card_add(body: CardIn, user: Unlocked) -> dict:
+    """Привязка карты. Сервер проверяет номер по Луну и срок, а хранит только платёжную систему,
+    последние 4 цифры, срок и имя. Неудачная попытка лимит частоты не тратит."""
+    if wait := guard.take_all([(_card_add_rate, user["id"])]):
+        raise slow_down(wait)
+    try:
+        brand, last4 = cards.check(body.number, body.expiry)
+        return db.add_card(user["id"], brand, last4, body.expiry, cards.normalize_holder(body.holder), cards.MAX_CARDS)
+    except cards.CardError as err:
+        _card_add_rate.refund(user["id"])
+        raise fail(err.status, err.code) from None
+    except sqlite3.OperationalError:
+        _card_add_rate.refund(user["id"])
+        raise
+
+
+@app.delete("/cards/{card_id}")
+def card_remove(card_id: CardId, user: Unlocked) -> dict:
+    if not db.remove_card(user["id"], card_id):
+        raise fail(404, "card_not_found")
+    return {"ok": True}
+
+
+@app.post("/cards/{card_id}/primary")
+def card_primary(card_id: CardId, user: Unlocked) -> dict:
+    if not db.set_primary_card(user["id"], card_id):
+        raise fail(404, "card_not_found")
+    return {"ok": True}
+
+
+@app.get("/cards/virtual")
+def virtual_card(user: Unlocked) -> dict:
+    """Учебная карта Qasynda: без реквизитов, только то, что видно на лицевой стороне в списке."""
+    card = cards.virtual(user["id"], user["card_last4"], user["full_name"])
+    return {"brand": card["brand"], "last4": card["last4"], "holder": card["holder"], "virtual": True}
+
+
+@app.get("/cards/virtual/secret")
+def virtual_card_secret(user: Unlocked, response: Response) -> dict:
+    """Полный номер, срок и CVV учебной карты. Только из разблокированной сессии и не чаще 10 раз в час:
+    даже учебные реквизиты не должны утекать из открытого на минуту телефона."""
+    if wait := guard.take_all([(_card_secret_rate, user["id"])]):
+        raise slow_down(wait)
+    response.headers["Cache-Control"] = "no-store"
+    card = cards.virtual(user["id"], user["card_last4"], user["full_name"])
+    return {k: card[k] for k in ("brand", "number", "expiry", "cvv", "holder")}
+
+
 @app.get("/me")
 def me(user: Unlocked) -> dict:
     return profile(user)
@@ -737,8 +808,10 @@ def transfers(user: Unlocked, limit: Annotated[int, Query(ge=1, le=100)] = 30) -
             counterparty = business or short_name(row["recipient_name"])
         else:
             counterparty = short_name(row["sender_name"])
+        merchant = row["recipient_is_merchant"] if outgoing else row["sender_is_merchant"]
         items.append({
             "id": row["id"], "direction": "out" if outgoing else "in", "counterparty": counterparty,
+            "is_merchant": bool(merchant),
             "amount": row["amount"], "method": row["method"], "note": row["note"],
             "created_at": row["created_at"],
         })
